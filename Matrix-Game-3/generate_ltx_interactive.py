@@ -5,10 +5,12 @@ This is the LTX-compatible counterpart of `pipeline/inference_interactive_pipeli
 (the Wan2.2 backend). It keeps MG3's interactive UX and segmented pacing verbatim:
 
   - Segment 0: 57 frames image-to-video from --image.
-  - Between segments the operator is prompted on stdin for a mouse action
-    (I/K/J/L/U = tilt up/tilt down/turn left/turn right/no move) and a keyboard
-    action (W/S/A/D/Q = forward/back/left/right/no move) — the same two-channel
-    input scheme as the Wan interactive pipeline.
+  - Generation NEVER waits for input (continuous mode): while a segment
+    generates, the operator may type a movement key (W/S/A/D) and/or camera
+    key (I/K/J/L) + Enter; the latest buffered line applies at the next
+    segment boundary. No input means neutral (Q+U) — the video keeps going
+    with the camera unchanged. Keys map to the same two-channel action
+    scheme as the Wan interactive pipeline (see get_current_action).
   - Segment i: --segment_frames (default 41) frames conditioned on the steered
     last --reinject_frames (default 8) decoded frames of segment i-1
     (multi-frame re-injection via stock LTX keyframe conditioning — frame_idx 0
@@ -47,6 +49,8 @@ Scripted (non-interactive) mode:
 """
 
 import argparse
+import select
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -79,7 +83,11 @@ KEYBOARD_IDX = {
 
 
 def get_current_action():
-    """MG3 two-channel stdin prompt. Returns (keyboard_onehot, mouse_vec)."""
+    """MG3 two-channel stdin prompt. Returns (keyboard_onehot, mouse_vec).
+
+    LEGACY blocking variant kept as the verbatim reference for the MG3 input
+    scheme; the generation loop uses the non-blocking poll_action() instead —
+    generation never waits on the operator."""
     print()
     print("-" * 30)
     print("PRESS [I, K, J, L, U] FOR CAMERA TRANSFORM\n"
@@ -310,11 +318,37 @@ def drop_frames(chunks, k):
     return [torch.cat(chunks, dim=0)[k:].contiguous()]
 
 
+def poll_action():
+    """Continuous-mode action read, never blocks. Generation does not wait
+    for input: whatever complete lines were typed ahead on stdin WHILE the
+    segment was generating are drained here and the LAST valid one wins;
+    nothing typed -> ("q", "u") = keep going, camera unchanged. A line may
+    carry a movement key (W/S/A/D) and/or a camera key (I/J/K/L) in any
+    order — "w", "j", "wj" are all valid; the key sets are disjoint."""
+    if not sys.stdin.isatty():
+        return "q", "u"
+    kb_key, mouse_key = "q", "u"
+    while select.select([sys.stdin], [], [], 0)[0]:
+        line = sys.stdin.readline()
+        if not line:  # EOF
+            break
+        kb, ms = "q", "u"
+        for ch in line.strip().lower():
+            if ch in KEYBOARD_IDX and ch != "q":
+                kb = ch
+            elif ch in CAMERA_VALUE_MAP and ch != "u":
+                ms = ch
+        if kb != "q" or ms != "u":
+            kb_key, mouse_key = kb, ms
+    return kb_key, mouse_key
+
+
 def _resolve_action(args, it):
     """Action for the segment after segment it.
 
-    Returns (kb_key, mouse_key) or None to quit. Interactive mode uses the MG3
-    two-prompt stdin UX; --actions uses scripted "keyboard+mouse" entries.
+    Returns (kb_key, mouse_key). Interactive mode never blocks: keys typed
+    during generation apply at the next boundary, no input means neutral
+    (poll_action). --actions uses scripted "keyboard+mouse" entries.
     """
     if args.actions:
         seq = [s.strip().lower() for s in args.actions.split(";")]
@@ -324,8 +358,7 @@ def _resolve_action(args, it):
         kb = parts[0] if parts[0] in _KEYBOARD_WARPS or parts[0] == "q" else "q"
         ms = parts[1] if len(parts) > 1 and parts[1] in _MOUSE_WARPS else "u"
         return (kb, ms)
-    _, _, kb_key, mouse_key = get_current_action()
-    return (kb_key, mouse_key)
+    return poll_action()
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +456,18 @@ def generate(args):
                          f"(got {args.reinject_frames})")
     k = args.reinject_frames
     total_frames = FIRST_SEGMENT_FRAMES + (args.num_iterations - 1) * (args.segment_frames - k)
-    input_mode = "scripted actions" if args.actions else "interactive stdin"
+    interactive_tty = not args.actions and sys.stdin.isatty()
+    input_mode = ("scripted actions" if args.actions
+                  else "continuous (type-ahead stdin)" if interactive_tty
+                  else "continuous (no tty: neutral drift)")
     print(f"[LTX interactive] mode={input_mode}, size={height}x{width}, "
           f"{args.num_iterations} iterations -> up to {total_frames} frames @ {args.frame_rate}fps")
+    if interactive_tty:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)  # drop stale buffered lines
+        print("[LTX interactive] generation NEVER waits: type WASD (move) / "
+              "IJKL (camera) + Enter ANYTIME while a segment generates; the "
+              "latest line applies at the next boundary, no input = straight on")
 
     if args.mgpu:
         if args.one_stage:
@@ -480,9 +522,10 @@ def generate(args):
         mouse_vec = CAMERA_VALUE_MAP[mouse_key]
         pose = compute_next_pose_from_action(pose, kb_vec, mouse_vec)
         pose_history.append(pose_to_c2w(pose))
-        print(f"[LTX interactive] action kb={kb_key} mouse={mouse_key} -> "
-              f"pose xyz=({pose[0]:.2f},{pose[1]:.2f},{pose[2]:.2f}) "
-              f"pitch={pose[3]:.1f} yaw={pose[4]:.1f}")
+        if kb_key != "q" or mouse_key != "u":
+            print(f"[LTX interactive] action kb={kb_key} mouse={mouse_key} -> "
+                  f"pose xyz=({pose[0]:.2f},{pose[1]:.2f},{pose[2]:.2f}) "
+                  f"pitch={pose[3]:.1f} yaw={pose[4]:.1f}")
 
         tail = save_tail_frames(seg_chunks, tmp_dir, it, k)
         steered = steer_tail_frames(tail, kb_key, mouse_key, steer_mode,

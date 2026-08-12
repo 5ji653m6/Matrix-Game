@@ -3,9 +3,12 @@
 
 Wraps the generate_ltx_interactive.py loop in a FastAPI server:
   - Models load ONCE at startup (background thread; /api/status reports readiness)
-  - One active session: client sends start/image+prompt, then per-turn actions
-    over WS; each generated segment is written as an mp4 chunk and sent back
-    as a URL for play-while-generating playback
+  - One active session: client sends start/image+prompt, then actions over WS
+    whenever it likes — generation NEVER waits for input (continuous mode):
+    the latest queued action applies at each segment boundary, and with no
+    input the video keeps going with the camera unchanged (neutral q/u).
+    Each generated segment is written as an mp4 chunk and sent back as a URL
+    for play-while-generating playback
   - Steering is the stock-weights zero-shot channel (depth-reprojection or 2D
     warp of the last K re-injected frames + motion phrase); pose state tracked
     with MG3's math for future PRoPE checkpoints
@@ -131,21 +134,22 @@ class Session:
                 if it == max_it - 1 or self.stop_flag.is_set():
                     break
 
-                self.emit({"type": "status", "state": "awaiting_action",
-                           "segment": it})
-                # --- wait for the operator ---
+                # --- continuous generation: input is OPTIONAL ---
+                # Never wait for the operator: drain whatever was typed while
+                # this segment was generating (latest action wins); nothing
+                # queued -> neutral q/u, i.e. keep going, camera unchanged.
+                act = None
                 while True:
                     try:
-                        act = self.actions.get(timeout=0.5)
+                        act = self.actions.get_nowait()
                     except queue.Empty:
-                        if self.stop_flag.is_set():
-                            act = None
-                        else:
-                            continue
+                        break
+                if self.stop_flag.is_set():
                     break
-                if act is None or self.stop_flag.is_set():
-                    break
-                kb_key, mouse_key = act["kb"], act["mouse"]
+                if act is None:
+                    kb_key, mouse_key = "q", "u"
+                else:
+                    kb_key, mouse_key = act["kb"], act["mouse"]
                 pose = GI.compute_next_pose_from_action(
                     pose, GI.KEYBOARD_IDX[kb_key], GI.CAMERA_VALUE_MAP[mouse_key])
                 pose_history.append(GI.pose_to_c2w(pose))
@@ -157,9 +161,10 @@ class Session:
                     steered, cond_strength, keyframe_strength)
                 _, phrase = GI._compose_warp(kb_key, mouse_key)
                 prompt_it = f"{prompt0}, {phrase}" if phrase else prompt0
-                self.emit({"type": "action_ack", "kb": kb_key,
-                           "mouse": mouse_key, "phrase": phrase,
-                           "pose": [round(float(v), 2) for v in pose]})
+                if act is not None:
+                    self.emit({"type": "action_ack", "kb": kb_key,
+                               "mouse": mouse_key, "phrase": phrase,
+                               "pose": [round(float(v), 2) for v in pose]})
 
             np.save(out_dir / "pose_history.npy",
                     np.stack(pose_history).astype(np.float32))

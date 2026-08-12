@@ -224,11 +224,11 @@ function bigstate(text, sub, spin) {
 }
 function setState(s, seg) {
   state = s;
-  deck.classList.toggle("disabled", s !== "awaiting_action");
-  if (s === "generating") bigstate("GENERATING", "segment " + (seg + 1) + " — stand by", true);
-  else if (s === "awaiting_action") bigstate("YOUR MOVE", "WASD move · IJKL camera", false);
+  deck.classList.toggle("disabled", s === "idle");
+  if (s === "generating") bigstate("LIVE", "segment " + (seg + 1) + " — WASD/IJKL anytime", true);
+  else if (s === "awaiting_action") bigstate("LIVE", "WASD move · IJKL camera", false);
   else if (s === "idle") bigstate("STANDBY", "", false);
-  led("led-session", s === "idle" ? "" : (s === "awaiting_action" ? "on" : "warn"));
+  led("led-session", s === "idle" ? "" : "on");
 }
 
 // ---------- video chunk queue ----------
@@ -337,10 +337,11 @@ $("btn-start").onclick = () => {
 };
 
 // ---------- controls ----------
+// Continuous mode: generation never waits. Actions are queued server-side
+// and the LATEST one applies at the next segment boundary.
 function sendAction(kb, mouse) {
-  if (state !== "awaiting_action") return;
+  if (state === "idle") return;
   ws.send(JSON.stringify({ type: "action", kb, mouse }));
-  setState("generating", segCount);
 }
 document.querySelectorAll(".key").forEach(k => {
   k.onclick = () => sendAction(k.dataset.kb || "q", k.dataset.mouse || "u");

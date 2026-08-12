@@ -152,9 +152,15 @@ streaming), just no longer a batch job either.
 ### 3.3 Interactive UX on stock weights (zero-shot steering)
 
 `generate_ltx_interactive.py` ports `pipeline/inference_interactive_pipeline.py`'s
-operator experience to the LTX backend: the same stdin two-channel prompts between
-segments (mouse I/K/J/L/U + keyboard W/S/A/D/Q), 57 frames first then
-`--segment_frames` (default 41), and per-segment + concatenated mp4 output.
+operator experience to the LTX backend — with one deliberate deviation:
+**generation never waits for input** (continuous mode). While a segment
+generates, type a movement key (W/S/A/D) and/or camera key (I/K/J/L) + Enter;
+the latest buffered line applies at the next segment boundary. No input means
+neutral (Q+U): the video keeps generating with the camera unchanged — camera
+input only re-angles the projection when you want it to. Segments: 57 frames
+first then `--segment_frames` (default 41), per-segment + concatenated mp4
+output. Scripted runs keep `--actions "w+u;w+j;none"` (one entry per
+iteration, `none`/missing = neutral).
 Because stock LTX-2.3 has no action conditioning, each action steers the next
 segment zero-shot. Two steering modes (`--steer_mode`):
 
@@ -303,9 +309,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 LTX_ROOT=/data1/LTX-2 \
 - The server binds `--host 0.0.0.0` by default with **no authentication** —
   anyone who can reach the port can burn GPU time; prefer an SSH tunnel on
   shared machines.
-- This is **turn-based chunk streaming** (~10–15s/turn with `--mgpu`), not
-  frame-level streaming — per-frame interactivity still needs the stage-2+
-  causal checkpoints.
+- This is **continuous chunk streaming**: the session never waits for input.
+  Keys pressed any time queue up and the latest applies at the next segment
+  boundary (~10–15s cadence with `--mgpu`); untouched, the video drifts
+  straight on until `--max_iterations` (default 24) or Stop. Still not
+  frame-level streaming — per-frame interactivity needs the stage-2+ causal
+  checkpoints.
 - Deps: `uv pip install --python <venv> fastapi "uvicorn[standard]" websockets python-multipart`.
 
 ---
