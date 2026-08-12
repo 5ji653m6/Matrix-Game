@@ -198,6 +198,14 @@ CUDA_VISIBLE_DEVICES=0 LTX_ROOT=/data1/LTX-2 \
 ```
 
 Scripted (non-interactive) mode for smoke tests: `--actions "w+u;w+l;d+j;none"`.
+Add `--mgpu` to run every segment across all visible GPUs (sequence-parallel
+distilled fleet + distributed VAE/Gemma, same controller as §3.2; requires
+`ltx-kernels`, ≥2 GPUs, distilled mode only). The fleet stays resident between
+turns, so per-turn latency drops from ~58s to ~10–15s on 4 idle H20s — the
+closest to "interactive" the stock checkpoints get. Caveats: each segment is
+decoded back from the fleet's mp4 (one extra x264 round-trip vs single-GPU),
+and the depth model shares GPU 0 with the rank-0 worker (a transient
+reprojection failure falls back to the 2D warp for that turn, logged).
 Known limitation: on extreme close-up subjects a lateral strafe opens a
 disocclusion band at the subject boundary that the fill can only guess —
 mitigated by the halved strafe step and strength<1 re-denoising; use
@@ -270,15 +278,34 @@ It shares §3.3's steering/re-injection machinery: `--steer_mode reproject|warp`
 
 ```bash
 cd Matrix-Game-3
-CUDA_VISIBLE_DEVICES=0 LTX_ROOT=/data1/LTX-2 \
-  /data1/ltx-world-model/.venv/bin/python server_ltx.py --port 8600
+CUDA_VISIBLE_DEVICES=0,1,2,3 LTX_ROOT=/data1/LTX-2 \
+  /data1/ltx-world-model/.venv/bin/python server_ltx.py --port 8600 --mgpu
 # open http://<box>:8600/  (or ssh -L 8600:localhost:8600)
 ```
 
-- One active session at a time (one GPU); extra clients are refused while busy.
-- `--use_base_model` switches the server to the one-stage dev checkpoint.
-- This is **turn-based chunk streaming** (~50s/turn distilled), not frame-level
-  streaming — per-frame interactivity still needs the stage-2+ causal checkpoints.
+- One active session at a time; extra clients are refused while busy.
+- `--mgpu` keeps the sequence-parallel fleet resident between turns → ~10–15s
+  per move instead of ~58s single-GPU (drop it and set
+  `CUDA_VISIBLE_DEVICES=<one GPU>` for the single-GPU path). The fleet is shut
+  down on server exit (app shutdown hook + atexit backstop).
+- **Fleet-lifetime gotcha (root-caused 2026-08-13):** torch's spawn bootstrap
+  arms every worker with `PR_SET_PDEATHSIG=SIGINT`, and Linux treats "parent"
+  as the spawning *thread*. If the thread that calls `controller.start()` ever
+  exits, the kernel SIGINTs every worker, torch's `_wrap` swallows the
+  KeyboardInterrupt into a silent exit 0 (no error.json, no log line), and the
+  controller's `poll()` never reports a clean exit — the next `stream()` hangs
+  forever with GPUs mysteriously idle. `build_mgpu_run_segment` therefore
+  starts the fleet on a dedicated thread that parks forever
+  (`_start_fleet_on_parked_thread`); never call `controller.start()` from a
+  short-lived thread.
+- `--use_base_model` switches the server to the one-stage dev checkpoint
+  (single-GPU only; incompatible with `--mgpu`).
+- The server binds `--host 0.0.0.0` by default with **no authentication** —
+  anyone who can reach the port can burn GPU time; prefer an SSH tunnel on
+  shared machines.
+- This is **turn-based chunk streaming** (~10–15s/turn with `--mgpu`), not
+  frame-level streaming — per-frame interactivity still needs the stage-2+
+  causal checkpoints.
 - Deps: `uv pip install --python <venv> fastapi "uvicorn[standard]" websockets python-multipart`.
 
 ---

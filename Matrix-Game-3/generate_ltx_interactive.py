@@ -257,24 +257,33 @@ def save_tail_frames(chunks, tmp_dir, it, k):
     return paths
 
 
-def steer_tail_frames(paths, kb_key, mouse_key, mode, reprojector, tmp_dir, it):
+def steer_tail_frames(paths, kb_key, mouse_key, mode, reprojector, tmp_dir, it,
+                      log=print):
     """Apply the action's camera delta to every tail frame (the virtual camera
     moved once between segments, so all re-injected frames share the delta).
-    No-op actions return the paths unchanged."""
+    No-op actions return the paths unchanged. Reprojection is all-or-nothing:
+    if any frame fails (e.g. transient OOM sharing a GPU with the MGPU fleet),
+    the whole turn falls back to the 2D warp so the K frames stay geometrically
+    consistent."""
     if kb_key == "q" and mouse_key == "u":
         return [Path(p) for p in paths]
-    steered = []
     if mode == "reproject":
         from PIL import Image
-        for j, p in enumerate(paths):
-            out = Path(tmp_dir) / f"cond_{it:03d}_{j:02d}_steered.png"
-            reprojector.reproject(Image.open(p).convert("RGB"),
-                                  kb_key, mouse_key).save(out)
-            steered.append(out)
-        return steered
+        try:
+            steered = []
+            for j, p in enumerate(paths):
+                out = Path(tmp_dir) / f"cond_{it:03d}_{j:02d}_steered.png"
+                reprojector.reproject(Image.open(p).convert("RGB"),
+                                      kb_key, mouse_key).save(out)
+                steered.append(out)
+            return steered
+        except Exception as e:
+            log(f"[steering] WARNING: reprojection failed ({type(e).__name__}: {e}); "
+                "falling back to 2D warp for this turn")
     spec, _ = _compose_warp(kb_key, mouse_key)
     if not spec:
         return [Path(p) for p in paths]
+    steered = []
     for j, p in enumerate(paths):
         out = Path(tmp_dir) / f"cond_{it:03d}_{j:02d}_steered.png"
         _warp_frame_spec(p, spec, out)
@@ -376,6 +385,13 @@ def parse_args():
                         help="Use the one-stage base (dev) checkpoint with full CFG "
                              "denoise instead of the distilled model (MG3-style "
                              "--use_base_model; slower per segment, higher fidelity)")
+    parser.add_argument("--mgpu", action="store_true",
+                        help="Run every segment across all visible GPUs via the "
+                             "ltx-pipelines MGPU fleet (sequence parallelism + "
+                             "distributed VAE/Gemma; distilled mode only, requires "
+                             "ltx-kernels). Cuts per-turn latency; each segment is "
+                             "decoded back from the fleet's mp4, costing one extra "
+                             "x264 round-trip vs single-GPU")
     parser.add_argument("--num_inference_steps", type=int, default=40,
                         help="Denoise steps per segment (base model only; distilled is fixed)")
     parser.add_argument("--guidance_scale", type=float, default=3.0)
@@ -411,7 +427,18 @@ def generate(args):
     print(f"[LTX interactive] mode={input_mode}, size={height}x{width}, "
           f"{args.num_iterations} iterations -> up to {total_frames} frames @ {args.frame_rate}fps")
 
-    run_segment = G._build_pipeline(args)
+    if args.mgpu:
+        if args.one_stage:
+            raise ValueError("--mgpu is only supported in distilled (two-stage) mode; "
+                             "no one-stage MGPU runner ships upstream.")
+        n_gpus = torch.cuda.device_count()
+        if n_gpus < 2:
+            raise RuntimeError(f"--mgpu needs >=2 visible GPUs, found {n_gpus}.")
+        print(f"[LTX interactive] MGPU fleet on {n_gpus} GPUs (sequence-parallel "
+              "distilled + distributed VAE/Gemma)")
+        run_segment = G.build_mgpu_run_segment(args, tmp_dir)
+    else:
+        run_segment = G._build_pipeline(args)
     steer_mode, reprojector, cond_strength, keyframe_strength = resolve_steering(args)
     print(f"[LTX interactive] steer_mode={steer_mode}, reinject K={k} "
           f"(cond={cond_strength}, keyframe={keyframe_strength}); "
@@ -469,6 +496,8 @@ def generate(args):
             print(f"[LTX interactive] steering: '{phrase}'")
         prompt_it = f"{args.prompt}, {phrase}" if phrase else args.prompt
 
+    if args.mgpu:
+        run_segment.shutdown()  # release the fleet before the final encode
     np.save(output_dir / f"{args.save_name}_pose_history.npy",
             np.stack(pose_history).astype(np.float32))
 

@@ -210,7 +210,11 @@ class ConsoleServer:
         )
 
     def load_pipeline(self):
-        self.run_segment = G._build_pipeline(self.pipeline_args)
+        if self.args.mgpu:
+            self.run_segment = G.build_mgpu_run_segment(
+                self.pipeline_args, self.output_dir / "mgpu_fleet")
+        else:
+            self.run_segment = G._build_pipeline(self.pipeline_args)
         self.steering = GI.resolve_steering(self.args)
         self.ready = True
 
@@ -226,6 +230,12 @@ app = FastAPI(title="LTX Interactive Console")
 @app.on_event("startup")
 def _startup():
     threading.Thread(target=server.load_pipeline, daemon=True).start()
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    if server is not None and server.args.mgpu and server.run_segment is not None:
+        server.run_segment.shutdown()  # release the worker fleet
 
 
 @app.get("/")
@@ -342,6 +352,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_iterations", type=int, default=24)
     parser.add_argument("--use_base_model", action="store_true")
+    parser.add_argument("--mgpu", action="store_true",
+                        help="Run every segment across all visible GPUs via the "
+                             "ltx-pipelines MGPU fleet (sequence-parallel distilled; "
+                             "requires ltx-kernels, >=2 GPUs, incompatible with "
+                             "--use_base_model). Fleet stays resident between turns.")
     parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument("--output_dir", type=str, default="./output_ltx_server")
     parser.add_argument("--segment_frames", type=int, default=GI.SEGMENT_FRAMES,
@@ -365,6 +380,12 @@ def main():
     if not 1 <= args.reinject_frames < args.segment_frames:
         parser.error(f"--reinject_frames must be in [1, segment_frames) "
                      f"(got {args.reinject_frames})")
+    if args.mgpu and args.use_base_model:
+        parser.error("--mgpu is distilled-mode only (no one-stage MGPU runner "
+                     "ships upstream); drop --use_base_model")
+    if args.mgpu and torch.cuda.device_count() < 2:
+        parser.error(f"--mgpu needs >=2 visible GPUs, found "
+                     f"{torch.cuda.device_count()}")
 
     server = ConsoleServer(args)
     app.mount("/chunks", StaticFiles(directory=server.output_dir), name="chunks")

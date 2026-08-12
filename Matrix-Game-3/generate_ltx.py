@@ -567,6 +567,101 @@ def _generate_mgpu(args, height, width, output_dir):
     print(f"[LTX backend] saved {video.shape[0]} frames -> {output_path}")
 
 
+def _start_fleet_on_parked_thread(controller, **setup_kwargs):
+    """Start the MGPU fleet on a dedicated thread that then parks FOREVER.
+
+    torch's spawn bootstrap arms every worker with PR_SET_PDEATHSIG=SIGINT,
+    and Linux treats "parent" here as the spawning *thread*: if the thread
+    that called controller.start() ever exits (e.g. the console server's
+    load_pipeline daemon thread returning), the kernel SIGINTs every worker,
+    and torch's _wrap swallows the KeyboardInterrupt into a silent exit 0 —
+    no error.json, no log line, and the controller's poll() never reports a
+    clean exit, so the next stream() hangs forever. Parking the spawning
+    thread for the life of the process closes that whole failure class.
+    The start itself is synchronous from the caller's perspective: this
+    returns once the fleet is ready, re-raising any startup failure."""
+    import threading
+
+    booted = threading.Event()
+    errors = []
+
+    def _own_the_fleet():
+        try:
+            controller.start(**setup_kwargs)
+        except BaseException as e:  # surface in the caller, whatever it is
+            errors.append(e)
+        finally:
+            booted.set()
+        threading.Event().wait()  # park forever; see docstring
+
+    threading.Thread(
+        target=_own_the_fleet, daemon=True, name="mgpu-fleet-owner"
+    ).start()
+    booted.wait()
+    if errors:
+        raise errors[0]
+
+
+def build_mgpu_run_segment(args, work_dir):
+    """The MGPU worker fleet as a `run_segment` callable with the same
+    signature/contract as the single-GPU `_build_pipeline` result:
+    (prompt, seed, height, width, num_frames, images) -> (video_iter, audio).
+
+    The fleet stays up across segments (workers keep the model resident);
+    each call streams one job whose rank 0 writes an mp4, which is decoded
+    back to frames so callers (interactive CLI, console server) stay
+    backend-agnostic. Costs one x264 round-trip per segment vs the
+    single-GPU path. Call `run_segment.shutdown()` when done (also
+    atexit-registered as a backstop so an exception mid-session never
+    orphans the fleet holding the GPUs)."""
+    import atexit
+    import itertools
+
+    from ltx_pipelines.distilled_mgpu import DistilledRunner
+    from ltx_pipelines.multigpu.controller import MGPUController
+    from ltx_pipelines.utils.media_io import decode_audio_from_file
+
+    vae_queue = torch.multiprocessing.get_context("spawn").SimpleQueue()
+    controller = MGPUController(DistilledRunner)
+    _start_fleet_on_parked_thread(
+        controller,
+        distilled_checkpoint_path=args.ltx_checkpoint,
+        gemma_root=args.gemma_root,
+        spatial_upsampler_path=args.spatial_upsampler,
+        vae_queue=vae_queue,
+    )
+    atexit.register(controller.shutdown)
+    seg_dir = Path(work_dir) / "mgpu_segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    counter = itertools.count()
+
+    def run_segment(prompt, seed, height, width, num_frames, images):
+        seg_path = seg_dir / f"mgpu_seg_{next(counter):03d}.mp4"
+        stream = controller.stream(
+            output_path=str(seg_path), prompt=prompt, seed=seed,
+            height=height, width=width, num_frames=num_frames,
+            frame_rate=int(args.frame_rate), images=list(images))
+        try:
+            for _ in stream:
+                pass  # drive the job; the runner writes seg_path on rank 0
+        finally:
+            stream.drain()  # no-op when fully consumed; frees the controller otherwise
+        video = torch.stack(_read_mp4_frames(seg_path)).float() / 255.0
+        audio = None
+        if not getattr(args, "no_audio", False):
+            audio = decode_audio_from_file(str(seg_path), device=torch.device("cpu"))
+            if audio is not None and audio.waveform.ndim == 3:
+                # decode_audio_from_file returns (1, C, N); encode_video
+                # validates for stereo (2, N) or (N, 2) — squeeze the batch dim.
+                from ltx_core.types import Audio
+                audio = Audio(waveform=audio.waveform.squeeze(0),
+                              sampling_rate=audio.sampling_rate)
+        return iter([video]), audio
+
+    run_segment.shutdown = controller.shutdown
+    return run_segment
+
+
 @torch.inference_mode()
 def generate(args):
     from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
