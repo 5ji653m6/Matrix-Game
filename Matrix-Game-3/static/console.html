@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MATRIX//GAME — LTX Interactive Console</title>
+<style>
+  :root {
+    --bg: #05070c; --panel: #0b101c; --edge: #1b2740;
+    --cyan: #00e5ff; --magenta: #ff2d95; --amber: #ffb300;
+    --green: #39ff88; --red: #ff4455; --dim: #5a6b8c; --text: #cfe3ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    min-height: 100vh; display: flex; flex-direction: column;
+    background-image:
+      radial-gradient(ellipse at 50% -10%, #0d1626 0%, transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0 3px, #ffffff04 3px 4px);
+  }
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+    border-bottom: 1px solid var(--edge); background: #070b13cc;
+  }
+  .logo { font-size: 18px; font-weight: 700; letter-spacing: 2px; color: #fff;
+    text-shadow: 0 0 12px var(--cyan); }
+  .logo span { color: var(--cyan); }
+  .sub { font-size: 10px; color: var(--dim); letter-spacing: 3px; }
+  .leds { margin-left: auto; display: flex; gap: 16px; font-size: 10px; color: var(--dim); }
+  .led::before { content: "●"; margin-right: 5px; color: var(--red); transition: color .3s; }
+  .led.on::before { color: var(--green); text-shadow: 0 0 8px var(--green); }
+  .led.warn::before { color: var(--amber); text-shadow: 0 0 8px var(--amber); }
+  /* ---------- viewport ---------- */
+  main { flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; padding: 14px; gap: 12px; }
+  .screen-wrap {
+    position: relative; width: min(92vw, 1060px); aspect-ratio: 16/9;
+    background: #000; border: 1px solid var(--edge); border-radius: 10px;
+    overflow: hidden; box-shadow: 0 0 40px #00e5ff22, inset 0 0 60px #000;
+  }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; background:#000; }
+  .overlay { position: absolute; inset: 0; pointer-events: none; }
+  .scanlines { background: repeating-linear-gradient(0deg, transparent 0 2px, #00000026 2px 4px); }
+  .vignette { box-shadow: inset 0 0 120px #000c; }
+  .crosshair { position: absolute; left: 50%; top: 50%; width: 26px; height: 26px;
+    transform: translate(-50%,-50%); opacity: .5; }
+  .crosshair::before, .crosshair::after { content: ""; position: absolute; background: var(--cyan); }
+  .crosshair::before { left: 50%; top: 0; width: 1px; height: 100%; }
+  .crosshair::after { top: 50%; left: 0; height: 1px; width: 100%; }
+  .hud { position: absolute; font-size: 11px; letter-spacing: 1px; color: var(--cyan);
+    text-shadow: 0 0 6px #00e5ff88; padding: 10px 12px; }
+  .hud.tl { top: 0; left: 0; } .hud.tr { top: 0; right: 0; text-align: right; }
+  .hud.bl { bottom: 0; left: 0; } .hud.br { bottom: 0; right: 0; text-align: right; }
+  .bigstate {
+    position: absolute; inset: 0; display: flex; flex-direction: column; gap: 10px;
+    align-items: center; justify-content: center; background: #000a;
+    font-size: 15px; letter-spacing: 4px; color: #fff; text-align: center;
+  }
+  .bigstate .sub2 { font-size: 10px; color: var(--dim); letter-spacing: 2px; }
+  .spin { width: 34px; height: 34px; border: 2px solid var(--edge);
+    border-top-color: var(--cyan); border-radius: 50%; animation: sp 0.9s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .hidden { display: none !important; }
+  /* ---------- deck ---------- */
+  .deck { display: flex; gap: 26px; align-items: stretch; width: min(92vw, 1060px); }
+  .cluster { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 12px; display: grid; gap: 6px; grid-template-columns: repeat(3, 52px);
+    grid-template-rows: repeat(3, 40px); justify-content: center; align-content: center; }
+  .cluster-label { grid-column: 1 / -1; font-size: 9px; letter-spacing: 2px;
+    color: var(--dim); text-align: center; }
+  .key {
+    background: #101828; border: 1px solid var(--edge); border-radius: 6px;
+    color: var(--text); font: inherit; font-size: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; user-select: none;
+    transition: all .08s;
+  }
+  .key small { font-size: 8px; color: var(--dim); margin-left: 4px; }
+  .key:active, .key.pressed { background: var(--cyan); color: #001318;
+    box-shadow: 0 0 14px var(--cyan); }
+  .deck.disabled .key { opacity: .3; pointer-events: none; }
+  .mid { flex: 1; display: flex; flex-direction: column; gap: 8px; justify-content: center; }
+  .btn {
+    font: inherit; font-size: 12px; letter-spacing: 2px; padding: 12px;
+    border-radius: 8px; border: 1px solid var(--edge); cursor: pointer;
+    background: #101828; color: var(--text); transition: all .15s;
+  }
+  .btn:hover { border-color: var(--cyan); }
+  .btn.primary { background: #002b33; border-color: var(--cyan); color: var(--cyan);
+    text-shadow: 0 0 8px #00e5ff88; }
+  .btn.danger { border-color: var(--red); color: var(--red); }
+  .ticker {
+    width: min(92vw, 1060px); height: 44px; overflow: hidden; font-size: 10px;
+    color: var(--dim); border-top: 1px solid var(--edge); padding-top: 6px;
+    display: flex; flex-direction: column-reverse;
+  }
+  .ticker div { white-space: nowrap; }
+  /* ---------- lobby ---------- */
+  .lobby {
+    position: fixed; inset: 0; z-index: 10; background: #05070cee;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .lobby-card {
+    width: min(94vw, 880px); background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 14px; padding: 22px; box-shadow: 0 0 60px #00e5ff18;
+  }
+  .lobby-card h1 { font-size: 20px; letter-spacing: 3px; color: #fff;
+    text-shadow: 0 0 14px var(--cyan); margin-bottom: 4px; }
+  .lobby-card h1 span { color: var(--cyan); }
+  .lobby-card .tag { font-size: 10px; color: var(--dim); letter-spacing: 2px; margin-bottom: 16px; }
+  .preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px; max-height: 260px; overflow-y: auto; margin-bottom: 14px; }
+  .preset { position: relative; border: 2px solid var(--edge); border-radius: 8px;
+    overflow: hidden; cursor: pointer; aspect-ratio: 16/9; background: #000; }
+  .preset img { width: 100%; height: 100%; object-fit: cover; opacity: .8; }
+  .preset.sel { border-color: var(--cyan); box-shadow: 0 0 14px #00e5ff66; }
+  .preset.sel img { opacity: 1; }
+  .preset label { position: absolute; bottom: 0; left: 0; right: 0; font-size: 9px;
+    padding: 3px 6px; background: #000b; color: var(--cyan); letter-spacing: 1px; }
+  textarea {
+    width: 100%; min-height: 74px; background: #070b13; color: var(--text);
+    border: 1px solid var(--edge); border-radius: 8px; padding: 10px;
+    font: inherit; font-size: 12px; resize: vertical; margin-bottom: 12px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row label { font-size: 10px; color: var(--dim); letter-spacing: 1px; }
+  .row input { width: 76px; background: #070b13; border: 1px solid var(--edge);
+    color: var(--text); border-radius: 6px; padding: 8px; font: inherit; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">MATRIX<span>//</span>GAME</div>
+    <div class="sub">LTX-2.3 INTERACTIVE CONSOLE</div>
+  </div>
+  <div class="leds">
+    <div class="led" id="led-link">LINK</div>
+    <div class="led" id="led-model">MODEL</div>
+    <div class="led" id="led-session">SESSION</div>
+  </div>
+</header>
+
+<main>
+  <div class="screen-wrap">
+    <video id="screen" playsinline></video>
+    <div class="overlay scanlines"></div>
+    <div class="overlay vignette"></div>
+    <div class="crosshair"></div>
+    <div class="hud tl" id="hud-seg">SEG ---</div>
+    <div class="hud tr" id="hud-pose">X +0.0 · YAW +0.0 · PITCH +0.0</div>
+    <div class="hud bl" id="hud-lat">TURN --.-s</div>
+    <div class="hud br" id="hud-model">--</div>
+    <div class="bigstate" id="bigstate">
+      <div class="spin hidden" id="spin"></div>
+      <div id="bigstate-text">STANDBY</div>
+      <div class="sub2" id="bigstate-sub"></div>
+    </div>
+  </div>
+
+  <div class="deck disabled" id="deck">
+    <div class="cluster">
+      <div class="cluster-label">MOVE — WASD</div>
+      <span></span><button class="key" data-kb="w">W<small>FWD</small></button><span></span>
+      <button class="key" data-kb="a">A<small>LEFT</small></button>
+      <button class="key" data-kb="s">S<small>BACK</small></button>
+      <button class="key" data-kb="d">D<small>RIGHT</small></button>
+      <span></span><button class="key" data-kb="q">Q<small>HOLD</small></button><span></span>
+    </div>
+    <div class="mid">
+      <button class="btn danger" id="btn-stop">■ END SESSION</button>
+      <button class="btn" id="btn-mute">🔇 SOUND OFF</button>
+    </div>
+    <div class="cluster">
+      <div class="cluster-label">CAMERA — IJKL</div>
+      <span></span><button class="key" data-mouse="i">I<small>UP</small></button><span></span>
+      <button class="key" data-mouse="j">J<small>LEFT</small></button>
+      <button class="key" data-mouse="k">K<small>DOWN</small></button>
+      <button class="key" data-mouse="l">L<small>RIGHT</small></button>
+      <span></span><button class="key" data-mouse="u">U<small>CENTER</small></button><span></span>
+    </div>
+  </div>
+
+  <div class="ticker" id="ticker"></div>
+</main>
+
+<div class="lobby" id="lobby">
+  <div class="lobby-card">
+    <h1>MATRIX<span>//</span>GAME <span style="color:var(--magenta)">LTX</span></h1>
+    <div class="tag">INTERACTIVE WORLD MODEL · SEGMENTED AUTOREGRESSIVE CONSOLE</div>
+    <div class="preset-grid" id="presets"></div>
+    <textarea id="prompt" placeholder="Describe the world…"></textarea>
+    <div class="row">
+      <label>SEED <input id="seed" type="number" value="42"></label>
+      <label>TURNS <input id="turns" type="number" value="6" min="1" max="24"></label>
+      <label style="flex:1"></label>
+      <button class="btn" id="btn-upload">⇪ UPLOAD IMAGE</button>
+      <input type="file" id="file" accept="image/*" class="hidden">
+      <button class="btn primary" id="btn-start">▶ START ENGINE</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const screen = $("screen"), deck = $("deck"), ticker = $("ticker");
+let ws, state = "boot", segCount = 0, queue = [], playing = false;
+let selImage = null, modelName = "";
+
+function log(msg) {
+  const d = document.createElement("div");
+  d.textContent = "» " + msg;
+  ticker.prepend(d);
+  while (ticker.children.length > 4) ticker.lastChild.remove();
+}
+function led(id, mode) { $(id).className = "led" + (mode ? " " + mode : ""); }
+function bigstate(text, sub, spin) {
+  $("bigstate").classList.toggle("hidden", !text);
+  $("bigstate-text").textContent = text || "";
+  $("bigstate-sub").textContent = sub || "";
+  $("spin").classList.toggle("hidden", !spin);
+}
+function setState(s, seg) {
+  state = s;
+  deck.classList.toggle("disabled", s !== "awaiting_action");
+  if (s === "generating") bigstate("GENERATING", "segment " + (seg + 1) + " — stand by", true);
+  else if (s === "awaiting_action") bigstate("YOUR MOVE", "WASD move · IJKL camera", false);
+  else if (s === "idle") bigstate("STANDBY", "", false);
+  led("led-session", s === "idle" ? "" : (s === "awaiting_action" ? "on" : "warn"));
+}
+
+// ---------- video chunk queue ----------
+function enqueue(url) {
+  queue.push(url);
+  if (!playing) playNext();
+}
+function playNext() {
+  const url = queue.shift();
+  if (!url) { playing = false; return; }
+  playing = true;
+  screen.src = url;
+  screen.play().catch(() => {});
+}
+screen.onended = playNext;
+$("btn-mute").onclick = () => {
+  screen.muted = !screen.muted;
+  $("btn-mute").textContent = screen.muted ? "🔇 SOUND OFF" : "🔊 SOUND ON";
+};
+screen.muted = true;
+
+// ---------- websocket ----------
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => { led("led-link", "on"); log("link established"); };
+  ws.onclose = () => { led("led-link", ""); log("link lost — retrying"); setTimeout(connect, 2000); };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "hello") {
+      modelName = m.model;
+      $("hud-model").textContent = m.model.replace("ltx-2.3-22b-", "").replace(".safetensors", "").toUpperCase();
+      led("led-model", m.ready ? "on" : "warn");
+      if (!m.ready) { $("btn-start").textContent = "MODEL LOADING…"; pollUntilReady(); }
+    } else if (m.type === "status") {
+      setState(m.state, m.segment || 0);
+    } else if (m.type === "segment") {
+      segCount = m.index + 1;
+      $("hud-seg").textContent = "SEG " + String(segCount).padStart(3, "0");
+      $("hud-lat").textContent = "TURN " + m.elapsed.toFixed(1) + "s";
+      $("hud-pose").textContent = poseText(m.pose);
+      enqueue(m.url + "?t=" + Date.now());
+      log("segment " + m.index + " · " + m.frames + "f · " + m.elapsed + "s");
+    } else if (m.type === "action_ack") {
+      $("hud-pose").textContent = poseText(m.pose);
+      log("action " + m.kb + "+" + m.mouse + (m.phrase ? " — " + m.phrase : ""));
+    } else if (m.type === "final") {
+      log("final render ready · " + m.frames + " frames");
+      queue.push(m.url + "?t=" + Date.now());
+      if (!playing) playNext();
+      bigstate("SESSION COMPLETE", "full replay queued", false);
+    } else if (m.type === "error") {
+      log("ERROR: " + m.message);
+      bigstate("ERROR", m.message, false);
+    }
+  };
+}
+function pollUntilReady() {
+  fetch("/api/status").then(r => r.json()).then(s => {
+    if (s.ready) {
+      led("led-model", "on");
+      $("btn-start").textContent = "▶ START ENGINE";
+    } else setTimeout(pollUntilReady, 3000);
+  });
+}
+function poseText(p) {
+  const f = v => (v >= 0 ? "+" : "") + v.toFixed(1);
+  return "X " + f(p[0]) + " · YAW " + f(p[4]) + " · PITCH " + f(p[3]);
+}
+
+// ---------- lobby ----------
+fetch("/api/presets").then(r => r.json()).then(list => {
+  const grid = $("presets");
+  list.forEach(p => {
+    const d = document.createElement("div");
+    d.className = "preset";
+    d.innerHTML = '<img src="' + p.url + '" loading="lazy"><label>' + p.key + "</label>";
+    d.onclick = () => {
+      document.querySelectorAll(".preset").forEach(x => x.classList.remove("sel"));
+      d.classList.add("sel");
+      selImage = p.url;
+      if (p.prompt) $("prompt").value = p.prompt;
+    };
+    grid.appendChild(d);
+  });
+});
+$("btn-upload").onclick = () => $("file").click();
+$("file").onchange = async () => {
+  const fd = new FormData();
+  fd.append("file", $("file").files[0]);
+  const r = await fetch("/api/upload", { method: "POST", body: fd }).then(x => x.json());
+  selImage = r.url;
+  document.querySelectorAll(".preset").forEach(x => x.classList.remove("sel"));
+  log("custom image uploaded");
+};
+$("btn-start").onclick = () => {
+  if (!selImage) { log("pick a world image first"); return; }
+  if (!$("prompt").value.trim()) { log("describe the world first"); return; }
+  $("lobby").classList.add("hidden");
+  segCount = 0; queue = [];
+  ws.send(JSON.stringify({
+    type: "start", image: selImage, prompt: $("prompt").value.trim(),
+    seed: +$("seed").value, num_iterations: +$("turns").value,
+  }));
+  log("engine start — first segment includes model warmup");
+  setState("generating", 0);
+};
+
+// ---------- controls ----------
+function sendAction(kb, mouse) {
+  if (state !== "awaiting_action") return;
+  ws.send(JSON.stringify({ type: "action", kb, mouse }));
+  setState("generating", segCount);
+}
+document.querySelectorAll(".key").forEach(k => {
+  k.onclick = () => sendAction(k.dataset.kb || "q", k.dataset.mouse || "u");
+});
+const KB = { w: 1, a: 1, s: 1, d: 1, q: 1 }, MS = { i: 1, j: 1, k: 1, l: 1, u: 1 };
+document.addEventListener("keydown", ev => {
+  if (!$("lobby").classList.contains("hidden")) return;
+  const key = ev.key.toLowerCase();
+  const el = document.querySelector('.key[data-kb="' + key + '"],.key[data-mouse="' + key + '"]');
+  if (el) { el.classList.add("pressed"); setTimeout(() => el.classList.remove("pressed"), 150); }
+  if (KB[key]) sendAction(key, "u");
+  else if (MS[key]) sendAction("q", key);
+});
+$("btn-stop").onclick = () => {
+  ws.send(JSON.stringify({ type: "stop" }));
+  log("stop requested — finalizing after current segment");
+  bigstate("FINALIZING", "concatenating session", true);
+};
+
+connect();
+</script>
+</body>
+</html>

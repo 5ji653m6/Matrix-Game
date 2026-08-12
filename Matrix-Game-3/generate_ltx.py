@@ -327,9 +327,10 @@ def _generate_audio_track(args, total_frames, wav_path):
     return wav_path
 
 
-def _concat_audios(audios, frame_rate):
+def _concat_audios(audios, frame_rate, trim_frames=1):
     """Concatenate per-segment Audio objects, trimming the duplicated first
-    frame's worth of samples from every segment after the first."""
+    `trim_frames` frames' worth of samples from every segment after the first
+    (1 frame for single-frame re-injection, K for K-frame re-injection)."""
     from ltx_core.types import Audio
 
     waveforms = []
@@ -342,8 +343,8 @@ def _concat_audios(audios, frame_rate):
         # Normalize to (2, N)
         if wf.shape[0] != 2:
             wf = wf.transpose(0, 1)
-        if i > 0:
-            trim = int(round(audio.sampling_rate / frame_rate))
+        if i > 0 and trim_frames > 0:
+            trim = int(round(trim_frames * audio.sampling_rate / frame_rate))
             wf = wf[:, trim:]
         waveforms.append(wf.cpu())
     return Audio(waveform=torch.cat(waveforms, dim=1),
@@ -681,6 +682,13 @@ def generate(args):
             final_audio = decode_audio_from_file(
                 args.audio_track_path, torch.device("cpu"),
                 0.0, n_frames / args.frame_rate)
+            wf = final_audio.waveform
+            if wf.ndim == 3 and wf.shape[0] == 1:
+                # decode_audio_from_file returns (1, C, N); encode_video
+                # validates for stereo (2, N) or (N, 2).
+                from ltx_core.types import Audio
+                final_audio = Audio(waveform=wf.squeeze(0),
+                                    sampling_rate=final_audio.sampling_rate)
         else:
             final_audio = _concat_audios(all_audios, args.frame_rate)
 

@@ -9,17 +9,30 @@ This is the LTX-compatible counterpart of `pipeline/inference_interactive_pipeli
     (I/K/J/L/U = tilt up/tilt down/turn left/turn right/no move) and a keyboard
     action (W/S/A/D/Q = forward/back/left/right/no move) — the same two-channel
     input scheme as the Wan interactive pipeline.
-  - Segment i: 41 frames conditioned on the (steered) last decoded frame of
-    segment i-1; the duplicated first frame is dropped -> 40 new frames.
+  - Segment i: --segment_frames (default 41) frames conditioned on the steered
+    last --reinject_frames (default 8) decoded frames of segment i-1
+    (multi-frame re-injection via stock LTX keyframe conditioning — frame_idx 0
+    is an exact latent replacement, frame_idx>0 are clean keyframe tokens,
+    which is MG3's memory-bank mechanism). The re-injected frames are dropped
+    from the output -> segment_frames - reinject_frames new frames per segment.
   - Per-segment mp4s plus one concatenated mp4 with audio are written.
 
 CONTROL REALITY (stock checkpoints): LTX-2.3 stock weights have no trained
 action/camera conditioning (PRoPE enters only via ltx-world-model stage-1+
 checkpoints, and the step-300 SFT checkpoints are poisoned — see
 ltx-world-model/docs/ROOT_CAUSE_STEP300.md). So actions steer through the
-zero-shot channel from generate_ltx.py: a geometric warp (crop/pan/zoom) of the
-conditioning frame + a matching motion phrase appended to the prompt. Camera
-pose state IS tracked with MG3's exact action->pose math (vendored below from
+zero-shot channel, two modes (--steer_mode):
+
+  - reproject (default): depth-based camera reprojection (steer3d.py) —
+    estimate monocular depth of each tail frame, unproject to a point cloud,
+    move a virtual pinhole camera by the action's rotation/translation, and
+    re-render with true parallax. Closest zero-shot substitute for MG3's
+    trained Plücker injector. Falls back to warp if the depth model
+    cannot be loaded.
+  - warp: the legacy 2D crop/pan/zoom warp of the conditioning frame.
+
+Both modes append a matching motion phrase to the prompt. Camera pose state
+IS tracked with MG3's exact action->pose math (vendored below from
 utils/utils.py + utils/cam_utils.py) and logged per segment, so swapping in a
 camera-conditioned checkpoint later only requires feeding `pose_history` into
 PRoPE CameraParams instead of the warp.
@@ -199,6 +212,95 @@ def _warp_frame_spec(src_path, spec, dst_path):
     warped.save(dst_path)
 
 
+# ---------------------------------------------------------------------------
+# Multi-frame re-injection + steering helpers (shared by this CLI and
+# server_ltx.py — do not duplicate the logic there).
+# ---------------------------------------------------------------------------
+def resolve_steering(args, log=print):
+    """Resolve (mode, reprojector, cond_strength, keyframe_strength).
+
+    reproject mode builds the Depth-Anything model; if it cannot load (no
+    network, OOM, missing transformers) we fall back to the 2D warp so the
+    session still runs. Strength defaults: reproject heals steered pixels
+    (0.92/0.90), warp is exact on the first frame (1.0/0.95)."""
+    mode = args.steer_mode
+    reprojector = None
+    if mode == "reproject":
+        try:
+            from steer3d import DepthReprojector
+            reprojector = DepthReprojector(model_id=args.depth_model, device=0,
+                                           focal_scale=args.reproj_focal,
+                                           step=args.reproj_step)
+            log(f"[steering] reproject mode: depth model {args.depth_model} loaded")
+        except Exception as e:
+            log(f"[steering] WARNING: depth reprojection unavailable "
+                f"({type(e).__name__}: {e}); falling back to 2D warp")
+            mode, reprojector = "warp", None
+    cond = args.cond_strength if args.cond_strength is not None else (
+        0.92 if mode == "reproject" else 1.0)
+    keyf = args.keyframe_strength if args.keyframe_strength is not None else (
+        0.90 if mode == "reproject" else 0.95)
+    return mode, reprojector, cond, keyf
+
+
+def save_tail_frames(chunks, tmp_dir, it, k):
+    """Save the last k decoded frames (oldest -> newest) as PNGs; returns paths."""
+    from PIL import Image
+
+    flat = torch.cat(chunks, dim=0)  # (T, H, W, C) float [0,1]
+    paths = []
+    for j in range(k):
+        frame = flat[-(k - j)].clamp(0, 1).float().cpu().numpy()
+        p = Path(tmp_dir) / f"cond_{it:03d}_{j:02d}.png"
+        Image.fromarray((frame * 255.0).round().astype(np.uint8)).save(p)
+        paths.append(p)
+    return paths
+
+
+def steer_tail_frames(paths, kb_key, mouse_key, mode, reprojector, tmp_dir, it):
+    """Apply the action's camera delta to every tail frame (the virtual camera
+    moved once between segments, so all re-injected frames share the delta).
+    No-op actions return the paths unchanged."""
+    if kb_key == "q" and mouse_key == "u":
+        return [Path(p) for p in paths]
+    steered = []
+    if mode == "reproject":
+        from PIL import Image
+        for j, p in enumerate(paths):
+            out = Path(tmp_dir) / f"cond_{it:03d}_{j:02d}_steered.png"
+            reprojector.reproject(Image.open(p).convert("RGB"),
+                                  kb_key, mouse_key).save(out)
+            steered.append(out)
+        return steered
+    spec, _ = _compose_warp(kb_key, mouse_key)
+    if not spec:
+        return [Path(p) for p in paths]
+    for j, p in enumerate(paths):
+        out = Path(tmp_dir) / f"cond_{it:03d}_{j:02d}_steered.png"
+        _warp_frame_spec(p, spec, out)
+        steered.append(out)
+    return steered
+
+
+def build_image_conditionings(paths, cond_strength, keyframe_strength):
+    """Oldest->newest tail frames -> LTX conditionings at frame_idx 0..K-1.
+
+    frame_idx 0 is an exact latent replacement (strength < 1 lets the model
+    heal the steered/inpainted pixels); frame_idx > 0 are clean keyframe
+    tokens — MG3's memory mechanism via stock LTX conditioning."""
+    from ltx_pipelines.utils.args import ImageConditioningInput
+    return [ImageConditioningInput(
+        path=str(p), frame_idx=j,
+        strength=cond_strength if j == 0 else keyframe_strength)
+        for j, p in enumerate(paths)]
+
+
+def drop_frames(chunks, k):
+    """Drop the first k frames of a decoded segment (the re-injected
+    conditioning frames), returning a single (T-k, H, W, C) chunk."""
+    return [torch.cat(chunks, dim=0)[k:].contiguous()]
+
+
 def _resolve_action(args, it):
     """Action for the segment after segment it.
 
@@ -232,7 +334,32 @@ def parse_args():
     parser.add_argument("--save_name", type=str, default="ltx_interactive")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_iterations", type=int, default=6,
-                        help="Total frames = 57 + (num_iterations - 1) * 40")
+                        help="Total frames = 57 + (num_iterations - 1) * "
+                             "(segment_frames - reinject_frames)")
+    parser.add_argument("--segment_frames", type=int, default=SEGMENT_FRAMES,
+                        help="Frames per continuation segment (must be ≡1 mod 8)")
+    parser.add_argument("--reinject_frames", type=int, default=8,
+                        help="Condition each continuation segment on the steered "
+                             "last K frames of the previous one (K=1 = legacy "
+                             "single-frame re-injection)")
+    parser.add_argument("--steer_mode", choices=["reproject", "warp"],
+                        default="reproject",
+                        help="reproject: depth-based camera reprojection with true "
+                             "parallax (steer3d.py; falls back to warp if the depth "
+                             "model cannot load). warp: legacy 2D crop/pan/zoom.")
+    parser.add_argument("--reproj_step", type=float, default=0.13,
+                        help="Per-segment translation as a fraction of the central "
+                             "subject's depth (0.13 ~ the 2D warp's zoom 1.15)")
+    parser.add_argument("--reproj_focal", type=float, default=1.2,
+                        help="Virtual camera focal length, in units of frame width")
+    parser.add_argument("--depth_model", type=str,
+                        default="depth-anything/Depth-Anything-V2-Small-hf")
+    parser.add_argument("--cond_strength", type=float, default=None,
+                        help="Conditioning strength for the newest tail frame "
+                             "(default: 0.92 reproject / 1.0 warp)")
+    parser.add_argument("--keyframe_strength", type=float, default=None,
+                        help="Conditioning strength for the older tail keyframes "
+                             "(default: 0.90 reproject / 0.95 warp)")
     parser.add_argument("--size", type=str, default="704*1280")
     parser.add_argument("--frame_rate", type=float, default=24.0)
     parser.add_argument("--ltx_checkpoint", type=str, default=str(G.DEFAULT_DISTILLED_CKPT))
@@ -245,8 +372,18 @@ def parse_args():
                         help="Let Gemma enhance the prompt (uses the conditioning image)")
     parser.add_argument("--no_audio", action="store_true")
     parser.add_argument("--crf", type=int, default=19)
+    parser.add_argument("--use_base_model", action="store_true",
+                        help="Use the one-stage base (dev) checkpoint with full CFG "
+                             "denoise instead of the distilled model (MG3-style "
+                             "--use_base_model; slower per segment, higher fidelity)")
+    parser.add_argument("--num_inference_steps", type=int, default=40,
+                        help="Denoise steps per segment (base model only; distilled is fixed)")
+    parser.add_argument("--guidance_scale", type=float, default=3.0)
+    parser.add_argument("--negative_prompt", type=str, default="")
     args = parser.parse_args()
-    args.one_stage = False  # interactive path is distilled two-stage only
+    args.one_stage = args.use_base_model
+    if args.use_base_model and args.ltx_checkpoint == str(G.DEFAULT_DISTILLED_CKPT):
+        args.ltx_checkpoint = str(G.DEFAULT_DEV_CKPT)
     return args
 
 
@@ -256,43 +393,47 @@ def generate(args):
 
     G._check_assets(args)
     height, width = (int(v) for v in args.size.split("*"))
-    if height % 64 or width % 64:
-        raise ValueError(f"Resolution {height}x{width} is not divisible by 64 "
-                         "(two-stage distilled pipeline constraint).")
+    div = 32 if args.one_stage else 64  # two-stage upsampler needs /64
+    if height % div or width % div:
+        raise ValueError(f"Resolution {height}x{width} is not divisible by {div}.")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="ltx_interactive_cond_", dir=output_dir))
 
-    total_frames = FIRST_SEGMENT_FRAMES + (args.num_iterations - 1) * (SEGMENT_FRAMES - 1)
-    mode = "scripted actions" if args.actions else "interactive stdin"
-    print(f"[LTX interactive] mode={mode}, size={height}x{width}, "
+    if (args.segment_frames - 1) % 8:
+        raise ValueError(f"--segment_frames must be ≡1 mod 8 (got {args.segment_frames})")
+    if not 1 <= args.reinject_frames < args.segment_frames:
+        raise ValueError(f"--reinject_frames must be in [1, segment_frames) "
+                         f"(got {args.reinject_frames})")
+    k = args.reinject_frames
+    total_frames = FIRST_SEGMENT_FRAMES + (args.num_iterations - 1) * (args.segment_frames - k)
+    input_mode = "scripted actions" if args.actions else "interactive stdin"
+    print(f"[LTX interactive] mode={input_mode}, size={height}x{width}, "
           f"{args.num_iterations} iterations -> up to {total_frames} frames @ {args.frame_rate}fps")
-    print("[LTX interactive] stock checkpoint: actions steer via zero-shot warp+motion text; "
-          "pose state is tracked for future camera-conditioned checkpoints")
 
     run_segment = G._build_pipeline(args)
+    steer_mode, reprojector, cond_strength, keyframe_strength = resolve_steering(args)
+    print(f"[LTX interactive] steer_mode={steer_mode}, reinject K={k} "
+          f"(cond={cond_strength}, keyframe={keyframe_strength}); "
+          "pose state is tracked for future camera-conditioned checkpoints")
 
     all_chunks, all_audios = [], []
-    cond_image_path = args.image
+    cond_images = build_image_conditionings([Path(args.image)], 1.0, 1.0)
     prompt_it = args.prompt
     pose = np.zeros(5, dtype=np.float32)  # [x, y, z, pitch, yaw], MG3 convention
     pose_history = [pose_to_c2w(pose)]
 
     for it in range(args.num_iterations):
-        num_frames = FIRST_SEGMENT_FRAMES if it == 0 else SEGMENT_FRAMES
-        from ltx_pipelines.utils.args import ImageConditioningInput
-        images = [ImageConditioningInput(path=str(cond_image_path), frame_idx=0, strength=1.0)]
+        num_frames = FIRST_SEGMENT_FRAMES if it == 0 else args.segment_frames
 
         t0 = time.time()
         video_iter, audio = run_segment(
-            prompt_it, args.seed + it, height, width, num_frames, images)
+            prompt_it, args.seed + it, height, width, num_frames, cond_images)
         seg_chunks = [c.cpu() for c in video_iter]
         print(f"[LTX interactive] segment {it}: {num_frames} frames in {time.time() - t0:.1f}s")
 
         if it > 0:
-            seg_chunks[0] = seg_chunks[0][1:]  # drop duplicated conditioning frame
-            if seg_chunks[0].shape[0] == 0:
-                seg_chunks.pop(0)
+            seg_chunks = drop_frames(seg_chunks, k)  # drop re-injected conditioning frames
 
         seg_path = output_dir / f"{args.save_name}_seg{it:03d}.mp4"
         encode_video(video=iter(seg_chunks), fps=int(args.frame_rate),
@@ -316,15 +457,14 @@ def generate(args):
               f"pose xyz=({pose[0]:.2f},{pose[1]:.2f},{pose[2]:.2f}) "
               f"pitch={pose[3]:.1f} yaw={pose[4]:.1f}")
 
-        cond_image_path = tmp_dir / f"cond_{it:03d}.png"
-        G._save_last_frame(seg_chunks, cond_image_path)
-
-        spec, phrase = _compose_warp(kb_key, mouse_key)
-        if spec:
-            warped_path = tmp_dir / f"cond_{it:03d}_warped.png"
-            _warp_frame_spec(cond_image_path, spec, warped_path)
-            cond_image_path = warped_path
-            print(f"[LTX interactive] steering: warp {spec}")
+        tail = save_tail_frames(seg_chunks, tmp_dir, it, k)
+        steered = steer_tail_frames(tail, kb_key, mouse_key, steer_mode,
+                                    reprojector, tmp_dir, it)
+        cond_images = build_image_conditionings(steered, cond_strength,
+                                                keyframe_strength)
+        _, phrase = _compose_warp(kb_key, mouse_key)
+        if kb_key != "q" or mouse_key != "u":
+            print(f"[LTX interactive] steering: {steer_mode} on last {k} frames")
         if phrase:
             print(f"[LTX interactive] steering: '{phrase}'")
         prompt_it = f"{args.prompt}, {phrase}" if phrase else args.prompt
@@ -334,7 +474,7 @@ def generate(args):
 
     final_audio = None
     if not args.no_audio and all_audios:
-        final_audio = G._concat_audios(all_audios, args.frame_rate)
+        final_audio = G._concat_audios(all_audios, args.frame_rate, trim_frames=k)
 
     output_path = output_dir / f"{args.save_name}.mp4"
     encode_video(video=iter(all_chunks), fps=int(args.frame_rate),

@@ -1,3 +1,7 @@
 # Generated LTX outputs (videos, per-segment clips, soundtracks)
 output_ltx/
 output_ltx_interactive/
+output_ltx_server/
+# AAA preset candidate-selection sheets (kept locally, not in the repo)
+demo_images_aaa/*/cand_*.jpg
+demo_images_aaa/sheet_*.jpg

@@ -153,11 +153,37 @@ streaming), just no longer a batch job either.
 
 `generate_ltx_interactive.py` ports `pipeline/inference_interactive_pipeline.py`'s
 operator experience to the LTX backend: the same stdin two-channel prompts between
-segments (mouse I/K/J/L/U + keyboard W/S/A/D/Q), the same 57-then-41-frame pacing,
-and per-segment + concatenated mp4 output. Because stock LTX-2.3 has no action
-conditioning, each action steers the next segment zero-shot — a geometric warp
-(crop/pan/zoom) of the conditioning frame plus a matching motion phrase appended to
-the prompt. MG3's exact action→pose math is vendored in and a per-segment c2w pose
+segments (mouse I/K/J/L/U + keyboard W/S/A/D/Q), 57 frames first then
+`--segment_frames` (default 41), and per-segment + concatenated mp4 output.
+Because stock LTX-2.3 has no action conditioning, each action steers the next
+segment zero-shot. Two steering modes (`--steer_mode`):
+
+- **`reproject` (default)** — depth-based camera reprojection (`steer3d.py`):
+  monocular depth (Depth-Anything-V2-Small, auto-downloaded from HF on first
+  use) → unproject to a point cloud → move a virtual pinhole camera by the
+  action's rotation/translation → re-render with a z-buffer splat and
+  depth-weighted hole fill. True parallax (near moves more than far) — the
+  closest zero-shot substitute for MG3's trained Plücker injector. If the depth
+  model cannot load (offline, OOM), it falls back to `warp` automatically.
+  Tune with `--reproj_step` (per-segment translation, fraction of subject
+  depth; 0.13 ≈ the warp's zoom 1.15) and `--reproj_focal`.
+- **`warp`** — the legacy 2D crop/pan/zoom of the conditioning frame.
+
+Both modes also append a matching motion phrase to the prompt. Two more knobs:
+
+- **`--reinject_frames K` (default 8)** — each continuation segment is
+  conditioned on the steered last K decoded frames (frame_idx 0 = exact latent
+  replacement, frame_idx 1..K-1 = clean keyframe tokens — MG3's memory-bank
+  mechanism via stock LTX keyframe conditioning). The K re-injected frames are
+  dropped from the output, so new frames per segment = `segment_frames − K`
+  (33 at defaults); total = `57 + (N−1)(segment_frames − K)`. K=1 reproduces
+  the legacy single-frame behavior.
+- **`--cond_strength` / `--keyframe_strength`** — conditioning strengths for the
+  newest frame vs. the older keyframes (defaults: 0.92/0.90 reproject,
+  1.0/0.95 warp). Strength < 1 lets the model heal the inpainted disocclusion
+  bands the reprojection leaves at depth edges.
+
+MG3's exact action→pose math is vendored in and a per-segment c2w pose
 history (`<save_name>_pose_history.npy`) is logged, ready to be fed into PRoPE
 `CameraParams` once a stage-1+ checkpoint from `ltx-world-model` is usable.
 
@@ -172,6 +198,13 @@ CUDA_VISIBLE_DEVICES=0 LTX_ROOT=/data1/LTX-2 \
 ```
 
 Scripted (non-interactive) mode for smoke tests: `--actions "w+u;w+l;d+j;none"`.
+Known limitation: on extreme close-up subjects a lateral strafe opens a
+disocclusion band at the subject boundary that the fill can only guess —
+mitigated by the halved strafe step and strength<1 re-denoising; use
+`--steer_mode warp` for such scenes if it bothers you.
+Add `--use_base_model` (optionally `--num_inference_steps 40`) to run the
+one-stage dev checkpoint with full CFG instead of the distilled model —
+higher fidelity per segment, but minutes-per-turn instead of ~1 minute.
 Do **not** point `--ltx_checkpoint` at the LTX-WM step-300 checkpoint — it generates
 pure noise (foreign-VAE training data; see ltx-world-model/docs/ROOT_CAUSE_STEP300.md).
 
@@ -221,6 +254,32 @@ CUDA_VISIBLE_DEVICES=0 LTX_ROOT=/data1/LTX-2 \
 
 The repo's `retrofit_audio.tsv` covers all 25 batch videos (prompts extracted from
 `batch_demo_ltx.sh` / `batch_aaa_ltx.sh`).
+
+### 3.5 WebSocket console server (persistent, chunk-streaming)
+
+`server_ltx.py` wraps the §3.3 interactive loop in a FastAPI server: models load
+once at startup, a browser client (`static/console.html`, gaming-console UI with
+WASD/IJKL capture and an on-screen controller deck) connects over `/ws`, picks a
+preset world image (or uploads one), and steers segment-by-segment. Each
+generated segment is served immediately as an mp4 chunk under `/chunks/<session>/`
+(play-while-generating), and END SESSION concatenates the run into `final.mp4`.
+It shares §3.3's steering/re-injection machinery: `--steer_mode reproject|warp`
+(default reproject, warp fallback), `--reinject_frames`, `--segment_frames`,
+`--reproj_step`, `--reproj_focal`, `--depth_model`, `--cond_strength`,
+`--keyframe_strength`.
+
+```bash
+cd Matrix-Game-3
+CUDA_VISIBLE_DEVICES=0 LTX_ROOT=/data1/LTX-2 \
+  /data1/ltx-world-model/.venv/bin/python server_ltx.py --port 8600
+# open http://<box>:8600/  (or ssh -L 8600:localhost:8600)
+```
+
+- One active session at a time (one GPU); extra clients are refused while busy.
+- `--use_base_model` switches the server to the one-stage dev checkpoint.
+- This is **turn-based chunk streaming** (~50s/turn distilled), not frame-level
+  streaming — per-frame interactivity still needs the stage-2+ causal checkpoints.
+- Deps: `uv pip install --python <venv> fastapi "uvicorn[standard]" websockets python-multipart`.
 
 ---
 
