@@ -59,6 +59,33 @@ If you want to use the base model, you can use `--use_base_model --num_inference
 For LightVAE, use `--vae_type mg_lightvae` with `--lightvae_pruning_rate 0.5`, or `--vae_type mg_lightvae_v2` with `--lightvae_pruning_rate 0.75`. `mg_lightvae_v2` is faster than `mg_lightvae` while keeping quality close to the latter.
 With multiple GPUs, you can pass `--use_async_vae --async_vae_warmup_iters 1` to speed up inference (see [`test.sh`](test.sh)).
 
+## 🧪 LTX-2.3 Backend (experimental, local addition)
+
+`generate_ltx.py` replaces the Wan2.2 backbone with [LTX-2.3](https://github.com/Lightricks/LTX-2) (22B audio-video DiT) while keeping MG3's segmented autoregressive scheme: segment 0 generates 57 frames from the input image, each further iteration generates 41 frames conditioned on the previous segment's last decoded frame (first duplicated frame dropped → 40 new frames), so `total_frames = 57 + (num_iterations - 1) * 40` as before. It also produces an audio track (LTX is a joint audio-video model; `--no_audio` to disable).
+
+``` sh
+bash test_ltx.sh
+# or directly:
+python generate_ltx.py --size 704*1280 --num_iterations 12 --seed 42 \
+    --image demo_images/001/image.png --prompt "..." --output_dir ./output_ltx
+```
+
+Requirements (paths are this machine's defaults, all overridable via flags):
+- LTX-2 monorepo: `LTX_ROOT` env or `/root/learning/LTX-2` (`packages/ltx-core`, `packages/ltx-pipelines` are sys.path-injected, not pip-installed)
+- Checkpoints: `/data/models/Lightricks--LTX-2.3/snapshots/master/` (distilled default; `--one_stage` switches to the dev checkpoint + CFG, `--num_inference_steps`/`--guidance_scale`)
+- Text encoder: Gemma-3-12B-IT at `/data1/models/google--gemma-3-12b-it/snapshots/master`
+- Python env: `/data1/ltx-world-model/.venv` (torch 2.13; `av`, `openimageio`, `cloudpickle` were added for ltx-pipelines)
+- Single GPU only, ~70GB+ VRAM. Default mode is the two-stage distilled pipeline (half-res → ×2 spatial upscale → refine).
+
+**Limitations vs. the Wan2.2 backend**: no keyboard/mouse/camera control — action conditioning lives in trained checkpoints from the sibling project `/data1/ltx-world-model` (whose `scripts/inference/infer_bidirectional_camera.py` is the right entry for those weights); no FSDP/Ulysses/int8/LightVAE (LTX has its own FP8/offload options, not wired here); `--interactive` is not supported.
+
+**Multi-GPU (`--mgpu`)**: runs one generation across all visible GPUs — sequence parallelism over the token sequence + Accelerate-sharded Gemma + distributed VAE decode, via ltx-pipelines' MGPU controller (`DistilledRunner`, fp8-cast by default). This is a **latency** tool, not a memory tool: each rank holds a full transformer replica. Distilled mode only; one mp4 per segment is written and the final video is combined from them. Requires the `ltx-kernels` CUDA extension (built from `$LTX_ROOT/packages/ltx-kernels`, needs nvcc + a pinned CUTLASS fetch).
+
+``` sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 python generate_ltx.py --mgpu \
+    --image demo_images/001/image.png --prompt "..." --num_iterations 12 --output_dir ./output_ltx
+```
+
 ## ⭐ Acknowledgements
 - [Diffusers](https://github.com/huggingface/diffusers) for their excellent diffusion model framework
 - [Self-Forcing](https://github.com/guandeh17/Self-Forcing) for their excellent work
