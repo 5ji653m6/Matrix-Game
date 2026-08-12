@@ -77,7 +77,16 @@ Requirements (paths are this machine's defaults, all overridable via flags):
 - Python env: `/data1/ltx-world-model/.venv` (torch 2.13; `av`, `openimageio`, `cloudpickle` were added for ltx-pipelines)
 - Single GPU only, ~70GB+ VRAM. Default mode is the two-stage distilled pipeline (half-res → ×2 spatial upscale → refine).
 
-**Limitations vs. the Wan2.2 backend**: no keyboard/mouse/camera control — action conditioning lives in trained checkpoints from the sibling project `/data1/ltx-world-model` (whose `scripts/inference/infer_bidirectional_camera.py` is the right entry for those weights); no FSDP/Ulysses/int8/LightVAE (LTX has its own FP8/offload options, not wired here); `--interactive` is not supported.
+**Limitations vs. the Wan2.2 backend**: no *trained* keyboard/mouse/camera control — learned action conditioning lives in checkpoints from the sibling project `/data1/ltx-world-model` (whose `scripts/inference/infer_bidirectional_camera.py` is the right entry for those weights); no FSDP/Ulysses/int8/LightVAE (LTX has its own FP8/offload options, not wired here).
+
+**Zero-shot interactive mimicry (`--interactive` / `--actions`)**: mimics MG3's action loop *without any training*. Between segments you steer the next segment with either a camera action (`w`=forward, `s`=backward, `a`/`d`=turn left/right, `up`/`down`=tilt, `none`, `quit`) or **free-form motion text** — in the MG series the control signal is just conditioning, so text is a first-class action channel via the Gemma text encoder. Warp actions apply a geometric crop/pan/zoom to the last decoded frame *and* inject a matching motion phrase into the prompt; free text steers semantically only. Control is **per-segment** (not per-frame) and latency is **turn-based** (one segment's generation time per move) — it is not real-time. Use `--segment_frames 17` for faster action response.
+
+``` sh
+# scripted steering (no TTY needed); or --interactive to type actions live
+python generate_ltx.py --mgpu --actions "left;the camera drifts past the gas station;forward" \
+    --segment_frames 17 --size 512*832 --num_iterations 4 \
+    --image demo_images/001/image.png --prompt "..." --output_dir ./output_ltx
+```
 
 **Multi-GPU (`--mgpu`)**: runs one generation across all visible GPUs — sequence parallelism over the token sequence + Accelerate-sharded Gemma + distributed VAE decode, via ltx-pipelines' MGPU controller (`DistilledRunner`, fp8-cast by default). This is a **latency** tool, not a memory tool: each rank holds a full transformer replica. Distilled mode only; one mp4 per segment is written and the final video is combined from them. Requires the `ltx-kernels` CUDA extension (built from `$LTX_ROOT/packages/ltx-kernels`, needs nvcc + a pinned CUTLASS fetch).
 

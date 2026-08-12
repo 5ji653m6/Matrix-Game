@@ -46,6 +46,15 @@ extension (built from $LTX_ROOT/packages/ltx-kernels). `--mgpu` writes one mp4
 per segment and re-encodes the final combined video from them (one extra x264
 generation; use --keep_segments to inspect per-segment output). `--one_stage`
 is not supported under `--mgpu` (no one-stage MGPU runner ships upstream).
+
+Zero-shot interactive mimicry (--interactive / --actions): between segments you
+steer the next segment with a camera action (w/a/s/d/up/down) or free-form
+motion text. Warp actions apply a geometric crop/pan/zoom to the last decoded
+frame AND inject a matching motion phrase into the prompt; free text steers
+semantically only (in the MG series the control signal is just conditioning, so
+text is a first-class action channel via Gemma). This mimics MG3's action loop
+WITHOUT trained action weights — control is per-segment (not per-frame) and
+latency is turn-based (one segment's generation time per move), not real-time.
 """
 
 import argparse
@@ -129,6 +138,18 @@ def parse_args():
     parser.add_argument("--keep_segments", action="store_true",
                         help="Also write one mp4 per segment next to the final video")
     parser.add_argument("--crf", type=int, default=19, help="x264 CRF for the output")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Zero-shot mimicry of MG3's interactive mode: prompt for a "
+                             "camera action between segments; the next segment is "
+                             "conditioned on a warped last frame (no trained action weights)")
+    parser.add_argument("--actions", type=str, default="",
+                        help="Semicolon-separated scripted steering, one entry per "
+                             "iteration: a warp alias (left/right/forward/...) or "
+                             "free-form motion text (e.g. 'left;the camera drifts "
+                             "past the gas station'); non-interactive alternative")
+    parser.add_argument("--segment_frames", type=int, default=SEGMENT_FRAMES,
+                        help="Frames per iteration after the first (must be 1 mod 8; "
+                             "shorter = faster action response in interactive mode)")
     return parser.parse_args()
 
 
@@ -228,6 +249,119 @@ def _concat_audios(audios, frame_rate):
 
 
 # ---------------------------------------------------------------------------
+# Zero-shot action control: warp the conditioning frame to mimic camera motion
+# (no trained action weights — the model is pinned to a first frame that looks
+# like the camera already moved, and its learned motion priors continue it)
+# ---------------------------------------------------------------------------
+_ACTION_ALIASES = {
+    "w": "forward", "forward": "forward",
+    "s": "backward", "backward": "backward",
+    "a": "left", "left": "left",
+    "d": "right", "right": "right",
+    "up": "up", "down": "down",
+    "n": "none", "none": "none", "": "none",
+}
+# zoom = dolly factor (>1 forward); dx/dy = crop-window shift as a fraction of
+# frame size, in the direction the camera turns.
+_ACTION_WARPS = {
+    "forward":  {"zoom": 1.15},
+    "backward": {"zoom": 0.87},
+    "left":     {"dx": -0.12},
+    "right":    {"dx": 0.12},
+    "up":       {"dy": -0.10},
+    "down":     {"dy": 0.10},
+}
+# Each warp action also injects a matching motion phrase into the segment's
+# prompt — Gemma steers generation semantically, the warp steers geometrically.
+_MOTION_PHRASES = {
+    "forward":  "the camera moves forward",
+    "backward": "the camera pulls back",
+    "left":     "the camera turns left",
+    "right":    "the camera turns right",
+    "up":       "the camera tilts up",
+    "down":     "the camera tilts down",
+}
+
+
+def _warp_frame(src_path, action, dst_path):
+    """Apply the camera-motion warp for `action` to the conditioning image."""
+    from PIL import Image, ImageFilter
+
+    img = Image.open(src_path).convert("RGB")
+    w, h = img.size
+    spec = _ACTION_WARPS[action]
+    zoom = spec.get("zoom", 1.0)
+    dx = spec.get("dx", 0.0) * w
+    dy = spec.get("dy", 0.0) * h
+    if zoom < 1.0:
+        # Dolly out: paste the frame onto a blurred upscaled copy of itself so
+        # the exposed borders carry scene color for the model to extend.
+        bw, bh = round(w / zoom), round(h / zoom)
+        canvas = img.resize((bw, bh), Image.LANCZOS).filter(
+            ImageFilter.GaussianBlur(radius=max(2, round((1.0 - zoom) * 60))))
+        canvas.paste(img, ((bw - w) // 2, (bh - h) // 2))
+        warped = canvas.resize((w, h), Image.LANCZOS)
+    else:
+        cw, ch = w / zoom, h / zoom
+        left = min(max((w - cw) / 2 + dx, 0.0), w - cw)
+        top = min(max((h - ch) / 2 + dy, 0.0), h - ch)
+        warped = img.crop((round(left), round(top),
+                           round(left + cw), round(top + ch))).resize((w, h), Image.LANCZOS)
+    warped.save(dst_path)
+
+
+def _resolve_steering(args, it):
+    """Steering for the segment after segment it.
+
+    Returns (warp_action_or_None, motion_text_or_None, quit_flag). The action
+    may be a warp alias (geometric warp + canned motion phrase) or free-form
+    motion text (semantic steering only) — in the MG series the control signal
+    is just conditioning, so text input is a first-class action channel.
+    """
+    if args.interactive:
+        while True:
+            raw = input(f"[LTX interactive] after segment {it}: action "
+                        "w/a/s/d/up/down, none, quit, or motion text > ").strip()
+            low = raw.lower()
+            if low in ("q", "quit"):
+                return None, None, True
+            action = _ACTION_ALIASES.get(low)
+            if action is not None:
+                if action == "none":
+                    return None, None, False
+                return action, _MOTION_PHRASES[action], False
+            if raw:
+                return None, raw, False  # free-form motion text
+            return None, None, False     # empty input = no steering
+    if args.actions:
+        seq = [s.strip() for s in args.actions.split(";")]
+        if it < len(seq) and seq[it]:
+            action = _ACTION_ALIASES.get(seq[it].lower())
+            if action is not None:
+                if action == "none":
+                    return None, None, False
+                return action, _MOTION_PHRASES[action], False
+            return None, seq[it], False  # free-form motion text
+    return None, None, False
+
+
+def _apply_steering(args, it, last_frame_path, tmp_dir):
+    """Apply the chosen steering. Returns (cond_image_path, motion_text) for
+    the next segment, or None to stop early."""
+    warp, motion, quit_ = _resolve_steering(args, it)
+    if quit_:
+        return None
+    cond_path = last_frame_path
+    if warp is not None:
+        cond_path = Path(tmp_dir) / f"cond_{it:03d}_{warp}.png"
+        _warp_frame(last_frame_path, warp, cond_path)
+        print(f"[LTX backend] action '{warp}' -> warped conditioning frame {cond_path}")
+    if motion:
+        print(f"[LTX backend] motion text: '{motion}'")
+    return cond_path, motion
+
+
+# ---------------------------------------------------------------------------
 # Multi-GPU path (--mgpu): ltx-pipelines MGPU controller, one job per segment
 # ---------------------------------------------------------------------------
 
@@ -275,16 +409,17 @@ def _generate_mgpu(args, height, width, output_dir):
     )
 
     seg_paths, cond_image_path = [], args.image
+    prompt_it = args.prompt
     try:
         for it in range(args.num_iterations):
-            num_frames = FIRST_SEGMENT_FRAMES if it == 0 else SEGMENT_FRAMES
+            num_frames = FIRST_SEGMENT_FRAMES if it == 0 else args.segment_frames
             seg_path = output_dir / f"{args.save_name}_seg{it:03d}.mp4"
             images = [ImageConditioningInput(path=str(cond_image_path),
                                              frame_idx=0, strength=1.0)]
             t0 = time.time()
             for _ in controller.stream(
                 output_path=str(seg_path),
-                prompt=args.prompt,
+                prompt=prompt_it,
                 seed=args.seed + it,
                 height=height,
                 width=width,
@@ -300,6 +435,11 @@ def _generate_mgpu(args, height, width, output_dir):
             if it < args.num_iterations - 1:
                 cond_image_path = tmp_dir / f"cond_{it:03d}.png"
                 _extract_last_frame_from_mp4(seg_path, cond_image_path)
+                steering = _apply_steering(args, it, cond_image_path, tmp_dir)
+                if steering is None:
+                    break
+                cond_image_path, motion = steering
+                prompt_it = f"{args.prompt}, {motion}" if motion else args.prompt
     finally:
         controller.shutdown()
 
@@ -336,10 +476,13 @@ def generate(args):
         raise ValueError(
             f"Resolution {height}x{width} is not divisible by 64. For two-stage "
             "pipelines, height and width must be multiples of 64.")
+    if args.segment_frames % 8 != 1:
+        raise ValueError(f"--segment_frames must be 1 mod 8 (LTX constraint), "
+                         f"got {args.segment_frames}.")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    total_frames = FIRST_SEGMENT_FRAMES + (args.num_iterations - 1) * NEW_FRAMES_PER_ITER
+    total_frames = FIRST_SEGMENT_FRAMES + (args.num_iterations - 1) * (args.segment_frames - 1)
 
     if args.mgpu:
         if args.one_stage:
@@ -362,16 +505,17 @@ def generate(args):
 
     all_chunks, all_audios = [], []
     cond_image_path = args.image
+    prompt_it = args.prompt
     tmp_dir = Path(tempfile.mkdtemp(prefix="ltx_cond_", dir=output_dir))
 
     for it in range(args.num_iterations):
-        num_frames = FIRST_SEGMENT_FRAMES if it == 0 else SEGMENT_FRAMES
+        num_frames = FIRST_SEGMENT_FRAMES if it == 0 else args.segment_frames
         seed = args.seed + it  # deterministic variation per segment
         images = [ImageConditioningInput(path=str(cond_image_path), frame_idx=0, strength=1.0)]
 
         t0 = time.time()
         video_iter, audio = run_segment(
-            args.prompt, seed, height, width, num_frames, images)
+            prompt_it, seed, height, width, num_frames, images)
         seg_chunks = [c.cpu() for c in video_iter]
         print(f"[LTX backend] segment {it}: {num_frames} frames in {time.time() - t0:.1f}s")
 
@@ -388,10 +532,17 @@ def generate(args):
                          output_path=str(seg_path),
                          video_chunks_number=len(seg_chunks), crf=args.crf)
 
-        # Next segment is conditioned on this segment's last decoded frame.
+        # Next segment is conditioned on this segment's last decoded frame,
+        # steered (warp + motion text) by the chosen action in
+        # interactive/scripted mode.
         if it < args.num_iterations - 1:
             cond_image_path = tmp_dir / f"cond_{it:03d}.png"
             _save_last_frame(seg_chunks, cond_image_path)
+            steering = _apply_steering(args, it, cond_image_path, tmp_dir)
+            if steering is None:
+                break
+            cond_image_path, motion = steering
+            prompt_it = f"{args.prompt}, {motion}" if motion else args.prompt
 
         all_chunks.extend(seg_chunks)
         all_audios.append(audio)
