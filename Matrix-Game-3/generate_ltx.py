@@ -75,11 +75,13 @@ for _pkg in ("ltx-core", "ltx-pipelines"):
     if _src.is_dir():
         sys.path.insert(0, str(_src))
 
-# Default local assets on this box
-DEFAULT_CKPT_DIR = Path("/data/models/Lightricks--LTX-2.3/snapshots/master")
+# Default local assets on this box (override the directory with LTX_CKPT_DIR)
+DEFAULT_CKPT_DIR = Path(os.environ.get(
+    "LTX_CKPT_DIR", "/data1/models/Lightricks--LTX-2.3/snapshots/master"))
 DEFAULT_DISTILLED_CKPT = DEFAULT_CKPT_DIR / "ltx-2.3-22b-distilled-1.1.safetensors"
 DEFAULT_DEV_CKPT = DEFAULT_CKPT_DIR / "ltx-2.3-22b-dev.safetensors"
 DEFAULT_UPSAMPLER = DEFAULT_CKPT_DIR / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+DEFAULT_DISTILLED_LORA = DEFAULT_CKPT_DIR / "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
 DEFAULT_GEMMA = "/data1/models/google--gemma-3-12b-it/snapshots/master"
 
 # MG3 pacing constants (pipeline/inference_pipeline.py): first clip 57 frames,
@@ -137,6 +139,26 @@ def parse_args():
                         help="Drop the generated audio track from the output mp4")
     parser.add_argument("--keep_segments", action="store_true",
                         help="Also write one mp4 per segment next to the final video")
+    # Coherent-audio mode (a2vid): one continuous soundtrack for the whole video
+    parser.add_argument("--audio_track", type=str, default="",
+                        help="Path to a pre-made soundtrack (wav/mp3/...). Each segment's "
+                             "video is generated conditioned on the matching slice of this "
+                             "track (A2Vid pipeline, audio frozen) and the final mux uses "
+                             "the track itself -> music/SFX stay coherent across segments")
+    parser.add_argument("--coherent_audio", action="store_true",
+                        help="Generate one full-length soundtrack with the text-to-audio "
+                             "pipeline (dev checkpoint) first, then use it like --audio_track")
+    parser.add_argument("--audio_prompt", type=str, default="",
+                        help="Text-to-audio prompt for --coherent_audio "
+                             "(default: derived from --prompt + continuity directives)")
+    parser.add_argument("--ltx_dev_checkpoint", type=str, default=str(DEFAULT_DEV_CKPT),
+                        help="Dev (non-distilled) checkpoint: T2A and A2Vid base model")
+    parser.add_argument("--distilled_lora", type=str, default=str(DEFAULT_DISTILLED_LORA),
+                        help="Distilled refinement LoRA for A2Vid stage 2")
+    parser.add_argument("--audio_num_inference_steps", type=int, default=40,
+                        help="T2A denoising steps (--coherent_audio)")
+    parser.add_argument("--audio_cfg_scale", type=float, default=3.0,
+                        help="T2A classifier-free guidance scale (--coherent_audio)")
     parser.add_argument("--crf", type=int, default=19, help="x264 CRF for the output")
     parser.add_argument("--interactive", action="store_true",
                         help="Zero-shot mimicry of MG3's interactive mode: prompt for a "
@@ -158,6 +180,12 @@ def _check_assets(args):
                if not Path(p).exists()]
     if not args.one_stage and not Path(args.spatial_upsampler).exists():
         missing.append(args.spatial_upsampler)
+    if getattr(args, "coherent_audio", False) or getattr(args, "audio_track", ""):
+        for p in (args.ltx_dev_checkpoint, args.distilled_lora):
+            if not Path(p).exists():
+                missing.append(p)
+        if args.audio_track and not Path(args.audio_track).exists():
+            missing.append(args.audio_track)
     if not (LTX_ROOT / "packages" / "ltx-core" / "src").is_dir():
         missing.append(str(LTX_ROOT) + " (set LTX_ROOT)")
     if missing:
@@ -166,6 +194,44 @@ def _check_assets(args):
 
 def _build_pipeline(args):
     """Construct the LTX pipeline (loads transformer, VAEs, Gemma)."""
+    if getattr(args, "audio_track_path", None):
+        # Coherent-audio mode: A2Vid two-stage (dev ckpt + distilled LoRA).
+        # The audio modality is FROZEN to the given soundtrack slice — the
+        # video is generated to match it — so concatenated segments share one
+        # continuous track instead of re-imagining the music every segment.
+        from ltx_core.components.guiders import MultiModalGuiderParams
+        from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+        from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
+
+        pipeline = A2VidPipelineTwoStage(
+            checkpoint_path=args.ltx_dev_checkpoint,
+            distilled_lora=[LoraPathStrengthAndSDOps(
+                args.distilled_lora, 1.0, LTXV_LORA_COMFY_RENAMING_MAP)],
+            spatial_upsampler_path=args.spatial_upsampler,
+            gemma_root=args.gemma_root,
+            loras=[],
+        )
+        guider = MultiModalGuiderParams(cfg_scale=args.guidance_scale)
+
+        def run_segment(prompt, seed, height, width, num_frames, images,
+                        audio_start_time=0.0):
+            return pipeline(
+                prompt=prompt,
+                negative_prompt=args.negative_prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=args.frame_rate,
+                num_inference_steps=args.num_inference_steps,
+                video_guider_params=guider,
+                images=list(images),  # ImageConditioningInput namedtuples (.path access inside)
+                audio_path=args.audio_track_path,
+                audio_start_time=audio_start_time,
+                audio_max_duration=num_frames / args.frame_rate,
+                enhance_prompt=args.enhance_prompt,
+            )
+        return run_segment
     if args.one_stage:
         from ltx_core.components.guiders import MultiModalGuiderParams
         from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
@@ -221,8 +287,44 @@ def _save_last_frame(chunks, path):
     from PIL import Image
     import numpy as np
 
-    frame = chunks[-1][-1].clamp(0, 1).cpu().numpy()
+    frame = chunks[-1][-1].clamp(0, 1).float().cpu().numpy()
     Image.fromarray((frame * 255.0).round().astype(np.uint8)).save(path)
+
+
+def _generate_audio_track(args, total_frames, wav_path):
+    """Generate one continuous soundtrack for the whole video via the
+    text-to-audio pipeline (dev checkpoint), so every segment can be
+    conditioned on a slice of the SAME music/SFX bed."""
+    from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
+    from ltx_pipelines.utils.media_io import encode_audio
+
+    prompt = args.audio_prompt or (
+        f"{args.prompt} Audio: one continuous unbroken musical track matching the "
+        "scene's mood, with a consistent tempo, key and instrumentation from start "
+        "to finish, plus subtle ambient sound effects that fit the environment. "
+        "No vocals, no silence, no abrupt style or instrument changes."
+    )
+    duration = total_frames / args.frame_rate
+    print(f"[LTX backend] generating coherent soundtrack: {duration:.1f}s via T2A "
+          f"({args.audio_num_inference_steps} steps)")
+    pipeline = T2AOneStagePipeline(
+        checkpoint_path=args.ltx_dev_checkpoint,
+        gemma_root=args.gemma_root,
+        loras=[],
+    )
+    audio = pipeline(
+        prompt=prompt,
+        negative_prompt="",
+        seed=args.seed,
+        num_frames=total_frames,
+        frame_rate=args.frame_rate,
+        num_inference_steps=args.audio_num_inference_steps,
+        audio_guider_params=MultiModalGuiderParams(cfg_scale=args.audio_cfg_scale),
+    )
+    encode_audio(audio, str(wav_path))
+    print(f"[LTX backend] soundtrack saved -> {wav_path}")
+    return wav_path
 
 
 def _concat_audios(audios, frame_rate):
@@ -484,6 +586,19 @@ def generate(args):
 
     total_frames = FIRST_SEGMENT_FRAMES + (args.num_iterations - 1) * (args.segment_frames - 1)
 
+    args.audio_track_path = None
+    if args.audio_track or args.coherent_audio:
+        if args.mgpu:
+            raise ValueError("Coherent-audio mode uses the A2Vid pipeline, which has "
+                             "no MGPU variant — run single-GPU (drop --mgpu).")
+        if args.one_stage:
+            raise ValueError("Coherent-audio mode is two-stage only (drop --one_stage).")
+        if args.audio_track:
+            args.audio_track_path = args.audio_track
+        else:
+            args.audio_track_path = str(_generate_audio_track(
+                args, total_frames, output_dir / f"{args.save_name}_soundtrack.wav"))
+
     if args.mgpu:
         if args.one_stage:
             raise ValueError("--mgpu is only supported in distilled (two-stage) mode; "
@@ -514,8 +629,17 @@ def generate(args):
         images = [ImageConditioningInput(path=str(cond_image_path), frame_idx=0, strength=1.0)]
 
         t0 = time.time()
-        video_iter, audio = run_segment(
-            prompt_it, seed, height, width, num_frames, images)
+        if args.audio_track_path:
+            # Slice the soundtrack at this segment's window. Segment i>=1 spans
+            # output frames [FIRST-1 + (i-1)*(seg-1), ...] (its first frame is
+            # the duplicated conditioning frame), so its audio starts there.
+            start_frame = 0 if it == 0 else FIRST_SEGMENT_FRAMES - 1 + (it - 1) * (args.segment_frames - 1)
+            video_iter, audio = run_segment(
+                prompt_it, seed, height, width, num_frames, images,
+                audio_start_time=start_frame / args.frame_rate)
+        else:
+            video_iter, audio = run_segment(
+                prompt_it, seed, height, width, num_frames, images)
         seg_chunks = [c.cpu() for c in video_iter]
         print(f"[LTX backend] segment {it}: {num_frames} frames in {time.time() - t0:.1f}s")
 
@@ -548,14 +672,22 @@ def generate(args):
         all_audios.append(audio)
 
     final_audio = None
+    n_frames = sum(c.shape[0] for c in all_chunks)
     if not args.no_audio:
-        final_audio = _concat_audios(all_audios, args.frame_rate)
+        if args.audio_track_path:
+            # Mux the soundtrack itself (lossless, seamless by construction),
+            # trimmed to the actual video duration.
+            from ltx_pipelines.utils.media_io import decode_audio_from_file
+            final_audio = decode_audio_from_file(
+                args.audio_track_path, torch.device("cpu"),
+                0.0, n_frames / args.frame_rate)
+        else:
+            final_audio = _concat_audios(all_audios, args.frame_rate)
 
     output_path = output_dir / f"{args.save_name}.mp4"
     encode_video(video=iter(all_chunks), fps=int(args.frame_rate),
                  audio=final_audio, output_path=str(output_path),
                  video_chunks_number=len(all_chunks), crf=args.crf)
-    n_frames = sum(c.shape[0] for c in all_chunks)
     print(f"[LTX backend] saved {n_frames} frames -> {output_path}")
 
 
