@@ -61,21 +61,30 @@ PRESET_PROMPTS = {
 # Session worker (blocking thread; talks to asyncio via queues)
 # ---------------------------------------------------------------------------
 class Session:
-    def __init__(self, server, ws_loop, event_q, params):
+    def __init__(self, server, params):
         self.server = server
-        self.loop = ws_loop
-        self.event_q = event_q
         self.params = params
         self.actions = queue.Queue()
         self.stop_flag = threading.Event()
         self.sid = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         self.thread = threading.Thread(target=self._run, daemon=True)
+        # resume state: what a (re)connecting client needs to catch up
+        self.segments = []       # segment event dicts, in order
+        self.current = -1        # segment index currently generating
+        self.pose = [0.0] * 5
 
     def emit(self, msg):
-        self.loop.call_soon_threadsafe(self.event_q.put_nowait, msg)
+        self.server.broadcast(msg)
 
     def start(self):
         self.thread.start()
+
+    def snapshot(self):
+        """State a (re)connecting client needs to resume watching live."""
+        return {"type": "session_resume", "sid": self.sid,
+                "prompt": self.params.get("prompt", ""),
+                "segments": list(self.segments), "current": self.current,
+                "pose": [round(float(v), 2) for v in self.pose]}
 
     @torch.inference_mode()  # whole thread: run_segment returns a LAZY iterator,
     def _run(self):          # so everything downstream must stay in inference mode
@@ -106,6 +115,7 @@ class Session:
             prompt_it = prompt0
 
             for it in range(max_it):
+                self.current = it
                 num_frames = GI.FIRST_SEGMENT_FRAMES if it == 0 else sargs.segment_frames
                 self.emit({"type": "status", "state": "generating", "segment": it})
                 t0 = time.time()
@@ -123,13 +133,16 @@ class Session:
                              video_chunks_number=len(seg_chunks), crf=args.crf)
                 all_chunks.extend(seg_chunks)
                 all_audios.append(audio)
-                self.emit({
+                seg_event = {
                     "type": "segment", "index": it,
                     "url": f"/chunks/{self.sid}/seg_{it:03d}.mp4",
                     "elapsed": round(elapsed, 1),
                     "frames": int(sum(c.shape[0] for c in seg_chunks)),
                     "pose": [round(float(v), 2) for v in pose],
-                })
+                }
+                self.segments.append(seg_event)  # resume backlog
+                self.pose = seg_event["pose"]
+                self.emit(seg_event)
 
                 if it == max_it - 1 or self.stop_flag.is_set():
                     break
@@ -177,8 +190,12 @@ class Session:
             self.emit({"type": "final",
                        "url": f"/chunks/{self.sid}/final.mp4",
                        "frames": int(sum(c.shape[0] for c in all_chunks))})
+            self.emit({"type": "session_end",
+                       "reason": "stopped" if self.stop_flag.is_set()
+                                 else "completed"})
         except Exception as e:
             self.emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
+            self.emit({"type": "session_end", "reason": "error"})
         finally:
             self.emit({"type": "status", "state": "idle"})
 
@@ -196,9 +213,11 @@ class ConsoleServer:
         self.run_segment = None
         self.steering = None  # (mode, reprojector, cond_strength, keyframe_strength)
         self.ready = False
+        self.load_error = None  # set if the loader thread dies (else invisible)
         self.session = None
         self.lock = threading.Lock()
-
+        self.loop = None      # the uvicorn asyncio loop, captured at startup
+        self.subs = set()     # asyncio.Queue of every connected WS client
         self.pipeline_args = SimpleNamespace(
             one_stage=args.use_base_model,
             ltx_checkpoint=(str(G.DEFAULT_DEV_CKPT) if args.use_base_model
@@ -214,14 +233,26 @@ class ConsoleServer:
             audio_track_path=None,
         )
 
+    def broadcast(self, msg):
+        """Fan an event out to every connected client (0 or more). Safe from
+        the session thread: each put is marshalled onto the uvicorn loop."""
+        if self.loop is None:
+            return
+        for q in list(self.subs):
+            self.loop.call_soon_threadsafe(q.put_nowait, msg)
+
     def load_pipeline(self):
-        if self.args.mgpu:
-            self.run_segment = G.build_mgpu_run_segment(
-                self.pipeline_args, self.output_dir / "mgpu_fleet")
-        else:
-            self.run_segment = G._build_pipeline(self.pipeline_args)
-        self.steering = GI.resolve_steering(self.args)
-        self.ready = True
+        try:
+            if self.args.mgpu:
+                self.run_segment = G.build_mgpu_run_segment(
+                    self.pipeline_args, self.output_dir / "mgpu_fleet")
+            else:
+                self.run_segment = G._build_pipeline(self.pipeline_args)
+            self.steering = GI.resolve_steering(self.args)
+            self.ready = True
+        except Exception as e:
+            self.load_error = f"{type(e).__name__}: {e}"
+            raise
 
     @property
     def busy(self):
@@ -234,6 +265,7 @@ app = FastAPI(title="LTX Interactive Console")
 
 @app.on_event("startup")
 def _startup():
+    server.loop = asyncio.get_running_loop()
     threading.Thread(target=server.load_pipeline, daemon=True).start()
 
 
@@ -251,6 +283,7 @@ def index():
 @app.get("/api/status")
 def status():
     return {"ready": server.ready, "busy": server.busy,
+            "load_error": server.load_error,
             "model": Path(server.pipeline_args.ltx_checkpoint).name}
 
 
@@ -295,7 +328,7 @@ def _resolve_image(url: str) -> str:
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     event_q = asyncio.Queue()
-    loop = asyncio.get_running_loop()
+    server.subs.add(event_q)
 
     async def send(msg):
         try:
@@ -305,6 +338,9 @@ async def ws_endpoint(ws: WebSocket):
 
     await send({"type": "hello", "ready": server.ready, "busy": server.busy,
                 "model": Path(server.pipeline_args.ltx_checkpoint).name})
+    s = server.session
+    if s is not None and s.thread.is_alive():
+        await send(s.snapshot())  # let a (re)connecting client catch up live
 
     async def receiver():
         async for raw in ws.iter_json():
@@ -313,7 +349,7 @@ async def ws_endpoint(ws: WebSocket):
                 if not server.ready:
                     await send({"type": "error", "message": "model still loading"})
                 elif server.busy:
-                    await send({"type": "error", "message": "session busy"})
+                    await send(server.session.snapshot())
                 else:
                     try:
                         raw["image_path"] = _resolve_image(raw["image"])
@@ -321,7 +357,7 @@ async def ws_endpoint(ws: WebSocket):
                         await send({"type": "error", "message": str(e)})
                         continue
                     with server.lock:
-                        server.session = Session(server, loop, event_q, raw)
+                        server.session = Session(server, raw)
                         server.session.start()
             elif t == "action":
                 s = server.session
@@ -344,8 +380,11 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         send_task.cancel()
-        if server.session:
-            server.session.stop_flag.set()
+        server.subs.discard(event_q)
+        # NOTE: the session is deliberately NOT stopped on disconnect — a
+        # dropped link must not kill a run; the next client resumes live via
+        # snapshot(). Only an explicit "stop" message (or the iteration cap)
+        # ends a session.
 
 
 def main():

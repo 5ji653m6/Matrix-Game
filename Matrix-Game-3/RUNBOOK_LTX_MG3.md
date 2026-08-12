@@ -289,7 +289,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 LTX_ROOT=/data1/LTX-2 \
 # open http://<box>:8600/  (or ssh -L 8600:localhost:8600)
 ```
 
-- One active session at a time; extra clients are refused while busy.
+- One active session at a time; extra clients are **not refused** — they
+  attach to the live session: every event is broadcast to all connected
+  clients (`ConsoleServer.subs`), and a client that connects (or reconnects)
+  mid-session immediately receives a `session_resume` snapshot (prompt, pose,
+  the segment backlog, current segment index) and replays the chunks it
+  missed. A dropped WebSocket does **not** kill the run — only an explicit
+  `stop` message or `--max_iterations` ends a session.
+- The console never overlays the scene while it is generating (progress lives
+  in the HUD: SEG / TURN / pose); the banner is reserved for STANDBY /
+  SESSION COMPLETE / STOPPED / ERROR.
 - `--mgpu` keeps the sequence-parallel fleet resident between turns → ~10–15s
   per move instead of ~58s single-GPU (drop it and set
   `CUDA_VISIBLE_DEVICES=<one GPU>` for the single-GPU path). The fleet is shut
